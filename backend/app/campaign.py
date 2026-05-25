@@ -1,10 +1,11 @@
 """Dunning escalation campaign — multi-stage cadence per overdue invoice."""
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from .chutes_client import chat
 from .config import REASONING_MODEL
 from .dunning import LANG_MAP
+from . import db
 
 
 STAGES = [
@@ -17,10 +18,6 @@ STAGES = [
     {"day": 14, "tone": "demand letter — formal, reference contract terms, mention next escalation",
      "subject_hint": "Final notice before escalation"},
 ]
-
-# In-memory campaign store (per hackathon)
-CAMPAIGNS: dict[str, dict] = {}
-
 
 STAGE_PROMPT = """You are an accounts-receivable specialist drafting stage {stage_n} of {stage_total}
 of a dunning campaign. Write in {language}. Max 130 words.
@@ -68,7 +65,7 @@ def _draft_stage(stage_idx: int, campaign: dict) -> dict:
     d["stage_index"] = stage_idx
     d["stage_day"] = stage["day"]
     d["language"] = language
-    d["generated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    d["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return d
 
 
@@ -83,33 +80,36 @@ def create_campaign(client_name: str, invoice_ref: str, invoice_amount: float,
         "outstanding": outstanding, "due_date": due,
         "current_stage": 0, "status": "active",
         "history": [],
-        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     first = _draft_stage(0, campaign)
     campaign["history"].append({**first, "sent": False})
-    CAMPAIGNS[cid] = campaign
+    db.upsert_campaign(campaign)
     return campaign
 
 
 def advance_campaign(cid: str) -> dict:
-    c = CAMPAIGNS.get(cid)
+    c = db.get_campaign(cid)
     if not c: raise KeyError(cid)
     if c["current_stage"] >= len(STAGES) - 1:
         c["status"] = "exhausted"
+        db.upsert_campaign(c)
         return c
     c["history"][-1]["sent"] = True
     c["current_stage"] += 1
     nxt = _draft_stage(c["current_stage"], c)
     c["history"].append({**nxt, "sent": False})
+    db.upsert_campaign(c)
     return c
 
 
 def mark_paid(cid: str) -> dict:
-    c = CAMPAIGNS.get(cid)
+    c = db.get_campaign(cid)
     if not c: raise KeyError(cid)
     c["status"] = "paid"
+    db.upsert_campaign(c)
     return c
 
 
 def list_campaigns() -> list[dict]:
-    return list(CAMPAIGNS.values())
+    return db.list_campaigns_db()

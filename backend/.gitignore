@@ -1,0 +1,4 @@
+data/treasury.db
+data/treasury.db-*
+data/inbox/*
+data/samples/*.pdf

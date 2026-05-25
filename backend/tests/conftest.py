@@ -1,11 +1,24 @@
-"""Test fixtures + LLM mocking. Tests run without hitting Chutes."""
+"""Test fixtures + LLM mocking + isolated test DB. Tests run without hitting Chutes."""
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 import pytest
 
 # Make `app` importable from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path, monkeypatch):
+    """Each test gets its own SQLite file — no state leaks between tests."""
+    from app import db as dbmod
+    test_db = tmp_path / "test.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", test_db)
+    monkeypatch.setattr(dbmod, "_initialized", False)
+    dbmod.init_db(test_db)
+    yield test_db
 
 
 class FakeChoice:
@@ -73,6 +86,23 @@ def mock_chutes(monkeypatch):
             if hasattr(m, "chat"): monkeypatch.setattr(m, "chat", fake_chat)
         except Exception:
             pass
+
+    # Patch the OpenAI client used by the agent (tool-calling path).
+    # See test_agent.py for the dedicated fixture that overrides per-test.
+    import app.agent as ag_mod
+    class _StubClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kw):
+                    # Default: immediate finish, no tool call, no decision parsing.
+                    class _M:
+                        content = '{"decision":"no_match","confidence":0,"reasoning":"stub"}'
+                        tool_calls = None
+                    class _R: choices = [type("C", (), {"message": _M})]
+                    return _R()
+    def _fake_get_client(use_fallback=False): return _StubClient()
+    monkeypatch.setattr(ag_mod, "get_client", _fake_get_client)
 
 
 @pytest.fixture

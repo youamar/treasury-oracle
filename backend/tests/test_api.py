@@ -36,8 +36,11 @@ def test_parse_statement_endpoint():
 
 
 def test_reconcile_endpoint(sample_proof, sample_txn):
+    # Use classical mode in this integration test so we don't depend on the
+    # full agent tool-call scripting (agent mode is covered in test_agent.py).
     r = client.post("/api/reconcile", json={
-        "proofs": [sample_proof], "transactions": [sample_txn], "bank": "Maybank",
+        "proofs": [sample_proof], "transactions": [sample_txn],
+        "bank": "Maybank", "mode": "classical",
     })
     assert r.status_code == 200
     j = r.json()

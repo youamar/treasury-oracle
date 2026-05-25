@@ -2,14 +2,15 @@
 import os
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .ocr import extract_payment_proof, pdf_to_images
 from .parser import parse_bank_statement
-from .matcher import reconcile
+from .matcher import reconcile as reconcile_classical
+from .agent import reconcile_agent
 from .report import build_report_pdf
 from .dunning import generate_dunning, boss_chart
 from .voice import transcribe_audio, extract_from_transcript
@@ -19,17 +20,30 @@ from .validator import validate_submission
 from .audit_pack import build_audit_pack
 from .campaign import create_campaign, advance_campaign, mark_paid, list_campaigns
 from .documentary import documentary_narrative
+from . import db
 
-app = FastAPI(title="Global Treasury Agent", version="0.2.0")
+app = FastAPI(title="Global Treasury Agent", version="0.3.0")
+
+
+@app.on_event("startup")
+def _startup():
+    db.init_db()
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-SESSIONS: dict[str, dict] = {}
 INBOX_DIR = Path(__file__).resolve().parent.parent / "data" / "inbox"
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_SEEN: set[str] = set()
+
+
+def _safe_inbox_path(filename: str) -> Path:
+    """Reject path traversal."""
+    name = Path(filename).name
+    if not name or name != filename:
+        raise HTTPException(400, "invalid filename")
+    return INBOX_DIR / name
 
 
 @app.get("/health")
@@ -70,22 +84,36 @@ class ReconcileRequest(BaseModel):
     proofs: list[dict]
     transactions: list[dict]
     bank: str = "default"
+    mode: str = "agent"  # "agent" | "classical"
 
 
 @app.post("/api/reconcile")
 async def reconcile_endpoint(body: ReconcileRequest):
-    result = reconcile(body.proofs, body.transactions, body.bank)
-    recon_id = str(uuid.uuid4())[:8]
-    SESSIONS[recon_id] = {"result": result, "bank": body.bank}
-    return {"recon_id": recon_id, **result}
+    if body.mode == "classical":
+        result = reconcile_classical(body.proofs, body.transactions, body.bank)
+        recon_id = str(uuid.uuid4())[:8]
+        result["mode"] = "classical"
+        db.save_session(recon_id, body.bank, result)
+        return {"recon_id": recon_id, **result}
+    # agent mode (default)
+    result = reconcile_agent(body.proofs, body.transactions, body.bank)
+    return result
+
+
+@app.get("/api/session/{recon_id}")
+def get_session(recon_id: str):
+    s = db.load_session(recon_id)
+    if not s:
+        raise HTTPException(404, "session not found")
+    return s
 
 
 @app.get("/api/report/{recon_id}")
 def get_report(recon_id: str):
-    if recon_id not in SESSIONS:
+    s = db.load_session(recon_id)
+    if not s:
         raise HTTPException(404, "session not found")
-    sess = SESSIONS[recon_id]
-    pdf = build_report_pdf(sess["result"], sess["bank"])
+    pdf = build_report_pdf(s, s["bank"])
     return Response(
         content=pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="reconciliation_{recon_id}.pdf"'},
@@ -97,13 +125,21 @@ def get_report(recon_id: str):
 class ConfirmSoftMatch(BaseModel):
     canonical_payer: str
     observed_in_txn: str
+    soft_match_id: int | None = None  # if provided, promote to strict match in DB
 
 
 @app.post("/api/soft-match/confirm")
 def confirm_soft(body: ConfirmSoftMatch):
-    """User confirmed a soft match — remember the alias for next time."""
+    """User confirmed a soft match — remember the alias AND promote to strict match."""
     remember_alias(body.canonical_payer, body.observed_in_txn)
-    return {"ok": True, "remembered": [body.canonical_payer, body.observed_in_txn]}
+    promoted = None
+    if body.soft_match_id is not None:
+        promoted = db.promote_soft_match(body.soft_match_id)
+    return {
+        "ok": True,
+        "remembered": [body.canonical_payer, body.observed_in_txn],
+        "session": promoted,
+    }
 
 
 # ---------- dunning email ----------
@@ -191,10 +227,7 @@ def fx_what_if(amount: float, from_ccy: str, to_ccy: str, days: int = 30):
     return what_if(amount, from_ccy, to_ccy, days)
 
 
-# ---------- FX watcher ----------
-
-WATCHERS: dict[str, dict] = {}
-
+# ---------- FX watcher (SQLite-backed) ----------
 
 class WatcherCreate(BaseModel):
     from_ccy: str
@@ -206,22 +239,23 @@ class WatcherCreate(BaseModel):
 @app.post("/api/fx/watcher")
 def fx_watcher_create(body: WatcherCreate):
     wid = str(uuid.uuid4())[:8]
-    WATCHERS[wid] = body.model_dump()
-    return {"id": wid, **body.model_dump()}
+    w = {"id": wid, **body.model_dump()}
+    db.upsert_watcher(w)
+    return w
 
 
 @app.get("/api/fx/watcher")
 def fx_watcher_list():
     out = []
-    for wid, w in WATCHERS.items():
+    for w in db.list_watchers():
         check = watcher_check(w["from_ccy"], w["to_ccy"], w["target_rate"])
-        out.append({"id": wid, **w, **check})
+        out.append({**w, **check})
     return {"watchers": out}
 
 
 @app.delete("/api/fx/watcher/{wid}")
 def fx_watcher_delete(wid: str):
-    WATCHERS.pop(wid, None)
+    db.delete_watcher(wid)
     return {"ok": True}
 
 
@@ -236,13 +270,13 @@ def sales_validate(proof: dict):
 
 @app.get("/api/audit-pack/{recon_id}/{match_index}")
 def audit_pack(recon_id: str, match_index: int):
-    if recon_id not in SESSIONS:
+    s = db.load_session(recon_id)
+    if not s:
         raise HTTPException(404, "session not found")
-    matches = SESSIONS[recon_id]["result"]["matches"]
+    matches = s["matches"]
     if match_index >= len(matches):
         raise HTTPException(404, "match index out of range")
-    bank = SESSIONS[recon_id]["bank"]
-    pdf = build_audit_pack(matches[match_index], bank)
+    pdf = build_audit_pack(matches[match_index], s["bank"])
     inv = matches[match_index]["proof"].get("reference", f"m{match_index}")
     return Response(
         content=pdf, media_type="application/pdf",
@@ -309,11 +343,11 @@ class MonthEndReq(BaseModel):
 
 @app.post("/api/month-end-close")
 def month_end_close(body: MonthEndReq):
-    """Batch: ingest every inbox file, parse latest statement if present, reconcile, return."""
-    # 1. Ingest all inbox files we haven't seen yet
+    """Batch: ingest every inbox file → returns proofs ready for reconcile."""
     proofs = []
     for p in sorted(INBOX_DIR.glob("*")):
-        if not p.is_file() or p.name.startswith("."): continue
+        if not p.is_file() or p.name.startswith("."):
+            continue
         try:
             data = p.read_bytes()
             if p.suffix.lower() == ".pdf":
@@ -325,13 +359,6 @@ def month_end_close(body: MonthEndReq):
         except Exception as e:
             proofs.append({"source_file": p.name, "error": str(e)})
 
-    # 2. Use the most recently parsed statement from sessions (if any)
-    latest_txns = []
-    for s in reversed(list(SESSIONS.values())):
-        # not the cleanest, but for hackathon: SESSIONS only stores reconcile results
-        # so we just return proofs and let user re-parse
-        break
-
     return {
         "ingested_proofs": len(proofs),
         "proofs": proofs,
@@ -341,7 +368,7 @@ def month_end_close(body: MonthEndReq):
 
 @app.post("/api/inbox/ingest/{filename}")
 def inbox_ingest(filename: str):
-    p = INBOX_DIR / filename
+    p = _safe_inbox_path(filename)
     if not p.exists():
         raise HTTPException(404, "file not in inbox")
     INBOX_SEEN.add(filename)

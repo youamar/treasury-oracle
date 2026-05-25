@@ -9,9 +9,7 @@ Returns soft-match candidates with a confidence score; UI asks the user to confi
 """
 from rapidfuzz import fuzz
 import re
-
-# Tiny in-memory "learning" store: maps payer aliases → canonical payer
-PAYER_ALIASES: dict[str, str] = {}
+from . import db
 
 
 def _normalize(s: str) -> str:
@@ -57,10 +55,11 @@ def soft_match_score(proof: dict, txn: dict) -> dict:
     name_sim = name_similarity(payer, desc)
     ref_sim = max(ref_overlap(ref, desc), ref_overlap(ref, txn_ref))
 
-    # Check historical aliases — if we've seen "Acme Corp" → "ACME CORP USA" before
+    # Check historical aliases — persisted in SQLite
     alias_boost = 0.0
     norm_payer = _normalize(payer)
-    if norm_payer in PAYER_ALIASES and PAYER_ALIASES[norm_payer] in _normalize(desc):
+    observed = db.lookup_alias(norm_payer)
+    if observed and observed in _normalize(desc):
         alias_boost = 0.2
 
     score = max(name_sim * 0.5 + ref_sim * 0.5, ref_sim) + alias_boost
@@ -88,4 +87,4 @@ def soft_match_score(proof: dict, txn: dict) -> dict:
 
 def remember_alias(canonical_payer: str, observed_in_txn: str):
     """Called when user confirms a soft match — learn this mapping for next time."""
-    PAYER_ALIASES[_normalize(canonical_payer)] = _normalize(observed_in_txn)
+    db.remember_alias(_normalize(canonical_payer), _normalize(observed_in_txn))
