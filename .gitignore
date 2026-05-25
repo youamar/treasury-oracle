@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+.env
+backend/data/samples/*.png
+backend/data/samples/*.csv
+.DS_Store
