@@ -11,6 +11,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @pytest.fixture(autouse=True)
+def stub_fx_http(monkeypatch):
+    """Make tests deterministic + offline by returning a fake ECB response.
+    The agent's FX-provenance guardrail (agent.py) requires a trusted source
+    for strict matches, so we mimic frankfurter.app's success shape here."""
+    import httpx
+    import app.tools as tools_mod
+
+    class _FakeResp:
+        status_code = 200
+        def __init__(self, payload): self._p = payload
+        def json(self): return self._p
+
+    def fake_get(url, *a, **kw):
+        # frankfurter.app/{date}?from=USD&to=MYR -> {"rates": {"MYR": 4.72}, ...}
+        # We only need one pair populated; other tests use USD->MYR.
+        if "frankfurter.app" in url and "to=" in url:
+            to_ccy = url.split("to=")[-1].split("&")[0]
+            return _FakeResp({"rates": {to_ccy.upper(): 4.72}})
+        return _FakeResp({})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    # Cached results from previous tests must not leak through.
+    tools_mod.get_fx_rate.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def isolated_db(tmp_path, monkeypatch):
     """Each test gets its own SQLite file — no state leaks between tests."""
     from app import db as dbmod

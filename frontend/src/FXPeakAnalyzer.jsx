@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
          ReferenceDot, ReferenceLine } from "recharts";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 const PAIRS = [
   ["USD","MYR"], ["EUR","MYR"], ["SGD","MYR"], ["GBP","MYR"], ["JPY","MYR"],

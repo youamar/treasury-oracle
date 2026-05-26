@@ -1,0 +1,26 @@
+{
+  "id": "04_discrepancy_swift",
+  "notes": "Material shortfall (~20%) explained by correspondent-bank chain. Should flag as discrepancy.",
+  "bank": "HSBC",
+  "proof": {
+    "amount": 2000.00,
+    "currency": "USD",
+    "date": "2026-05-10",
+    "payer": "Pacific Holdings",
+    "payee": "BrightTech",
+    "reference": "INV-2026-022",
+    "source_file": "eval_04.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e04_a",
+      "date": "2026-05-10",
+      "amount": 7480.00,
+      "currency": "MYR",
+      "description": "INWARD PACIFIC HOLDINGS",
+      "reference": "INV-2026-022"
+    }
+  ],
+  "expected_decision": "discrepancy",
+  "expected_txn_id": "txn_e04_a"
+}

@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 export default function DunningModal({ proof, expected, actual, localCcy, onClose }) {
   const [email, setEmail] = useState(null);

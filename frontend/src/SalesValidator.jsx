@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 export default function SalesValidator() {
   const [form, setForm] = useState({ amount: "", currency: "$", date: "", payer: "", reference: "" });

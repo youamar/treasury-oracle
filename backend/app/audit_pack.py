@@ -1,6 +1,6 @@
 """Audit Defense Pack — per-transaction evidence bundle PDF for LHDN/auditors."""
 import io
-from datetime import datetime
+from datetime import datetime, timezone
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
@@ -23,7 +23,7 @@ def build_audit_pack(match: dict, bank_name: str) -> bytes:
     story = []
     story.append(Paragraph(f"AUDIT EVIDENCE PACK — {p.get('reference','no-ref')}", h1))
     story.append(Paragraph(
-        f"Generated {datetime.utcnow().isoformat(timespec='seconds')}Z · "
+        f"Generated {datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', '')}Z · "
         f"Bank: {bank_name} · Confidence: {int(match['confidence']*100)}%", small))
     story.append(Spacer(1, 0.4*cm))
 
@@ -79,6 +79,49 @@ def build_audit_pack(match: dict, bank_name: str) -> bytes:
         story.append(t)
         story.append(Spacer(1, 0.3*cm))
 
+    # §5.5 — provenance table (every numeric → its source)
+    prov = c.get("provenance") or {}
+    if prov:
+        story.append(Paragraph("§5.5 PROVENANCE OF EVERY NUMBER ABOVE", h2))
+        story.append(Paragraph(
+            "Each numeric in this report is traceable to its origin. "
+            "<b>trusted=False</b> means the value did not come from a verified source "
+            "(e.g. live ECB feed, bank statement, or signed config) and the match "
+            "was downgraded accordingly.", small))
+        prov_rows = [["Field", "Value", "Source", "As of", "Trusted"]]
+        for field_name in ("proof_amount", "fx_rate", "fee", "expected_gross",
+                           "expected_net", "actual_received"):
+            entry = prov.get(field_name) or {}
+            prov_rows.append([
+                field_name,
+                str(entry.get("value", "—")),
+                str(entry.get("source", "—")),
+                str(entry.get("asof", "—")),
+                "Yes" if entry.get("trusted") else "No",
+            ])
+        # SHA-256 of the original proof bytes — the legal hook
+        sha = (prov.get("proof_amount") or {}).get("source_sha256")
+        if sha:
+            prov_rows.append(["proof_source_sha256", sha[:16] + "…", "uploads", "—", "Yes"])
+        pt = Table(prov_rows, colWidths=[3.5*cm, 3.0*cm, 6.5*cm, 2.5*cm, 1.5*cm])
+        pt.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f172a")),
+            ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("FONTNAME", (1,1), (1,-1), "Courier"),
+            ("FONTNAME", (2,1), (2,-1), "Courier"),
+        ]))
+        story.append(pt)
+        if prov.get("all_inputs_trusted") is False:
+            story.append(Spacer(1, 0.15*cm))
+            story.append(Paragraph(
+                "<font color='#b45309'>⚠ One or more inputs above were not from a "
+                "trusted source. This match should not be cited as final without "
+                "operator confirmation.</font>", small))
+        story.append(Spacer(1, 0.3*cm))
+
     story.append(Paragraph("§6 AGENT REASONING (chain of custody)", h2))
     story.append(Paragraph(match.get("reasoning",""), small))
 
@@ -94,7 +137,7 @@ def build_audit_pack(match: dict, bank_name: str) -> bytes:
 
     story.append(Spacer(1, 0.4*cm))
     story.append(Paragraph(
-        f"<i>Document ID: AUDIT-{tx['id']}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}</i>",
+        f"<i>Document ID: AUDIT-{tx['id']}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}</i>",
         mono))
 
     doc.build(story)

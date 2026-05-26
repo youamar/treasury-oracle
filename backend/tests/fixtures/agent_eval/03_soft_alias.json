@@ -1,0 +1,26 @@
+{
+  "id": "03_soft_alias",
+  "notes": "Payer name on bank statement doesn't match proof; reference and amount do. Should soft-match.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 800.00,
+    "currency": "USD",
+    "date": "2026-05-15",
+    "payer": "GlobalSoft Ltd",
+    "payee": "BrightTech",
+    "reference": "INV-2026-014",
+    "source_file": "eval_03.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e03_a",
+      "date": "2026-05-15",
+      "amount": 3757.12,
+      "currency": "MYR",
+      "description": "INWARD TT GS HOLDINGS",
+      "reference": "INV-2026-014"
+    }
+  ],
+  "expected_decision": "soft",
+  "expected_txn_id": "txn_e03_a"
+}

@@ -108,3 +108,77 @@ def test_voice_transcript_endpoint():
     r = client.post("/api/voice", data={"transcript": "Sent 500 USD for INV-007."})
     assert r.status_code == 200
     assert r.json()["amount"] == 500
+
+
+def test_reconcile_idempotency_returns_cached_session():
+    """F8: same Idempotency-Key + same body returns the cached recon_id,
+    no second LLM call."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+
+    body = {
+        "proofs": [{"amount": 1000.0, "currency": "USD", "date": "2026-05-20",
+                    "payer": "Acme", "payee": "BT", "reference": "INV-IDEM",
+                    "source_file": "p.png"}],
+        "transactions": [{"id": "txn_0", "date": "2026-05-20",
+                          "amount": 4696.40, "currency": "MYR",
+                          "description": "INWARD", "reference": "INV-IDEM",
+                          "direction": "in"}],
+        "bank": "Maybank",
+        "mode": "classical",  # deterministic, no LLM noise
+    }
+    r1 = client.post("/api/reconcile", json=body,
+                     headers={"Idempotency-Key": "test-key-1"})
+    assert r1.status_code == 200
+    j1 = r1.json()
+    rid1 = j1["recon_id"]
+    assert "idempotent_replay" not in j1
+
+    r2 = client.post("/api/reconcile", json=body,
+                     headers={"Idempotency-Key": "test-key-1"})
+    assert r2.status_code == 200
+    j2 = r2.json()
+    assert j2["recon_id"] == rid1
+    assert j2.get("idempotent_replay") is True
+
+
+def test_reconcile_idempotency_conflict_on_different_body():
+    """Same key + different body → 409 conflict (Stripe-style)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+
+    body_a = {
+        "proofs": [{"amount": 1000.0, "currency": "USD", "date": "2026-05-20",
+                    "source_file": "a.png"}],
+        "transactions": [{"id": "txn_0", "date": "2026-05-20", "amount": 4700,
+                          "currency": "MYR", "direction": "in"}],
+        "bank": "Maybank", "mode": "classical",
+    }
+    body_b = {**body_a, "bank": "CIMB"}
+
+    r1 = client.post("/api/reconcile", json=body_a,
+                     headers={"Idempotency-Key": "conflict-key"})
+    assert r1.status_code == 200
+    r2 = client.post("/api/reconcile", json=body_b,
+                     headers={"Idempotency-Key": "conflict-key"})
+    assert r2.status_code == 409
+
+
+def test_reconcile_no_key_runs_every_time():
+    """Without an Idempotency-Key, each call produces a fresh recon_id."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+
+    body = {
+        "proofs": [{"amount": 1000.0, "currency": "USD", "date": "2026-05-20",
+                    "source_file": "p.png"}],
+        "transactions": [{"id": "txn_0", "date": "2026-05-20", "amount": 4700,
+                          "currency": "MYR", "direction": "in"}],
+        "bank": "Maybank", "mode": "classical",
+    }
+    r1 = client.post("/api/reconcile", json=body).json()
+    r2 = client.post("/api/reconcile", json=body).json()
+    assert r1["recon_id"] != r2["recon_id"]

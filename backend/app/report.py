@@ -1,6 +1,6 @@
 """Generate PDF reconciliation report from matcher output."""
 import io
-from datetime import datetime
+from datetime import datetime, timezone
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
@@ -23,7 +23,7 @@ def build_report_pdf(result: dict, bank_name: str = "default") -> bytes:
     story = []
     story.append(Paragraph("Cross-Border Reconciliation Report", h1))
     story.append(Paragraph(
-        f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · Bank: {bank_name}",
+        f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · Bank: {bank_name}",
         small,
     ))
     story.append(Spacer(1, 0.4*cm))

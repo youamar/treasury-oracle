@@ -1,0 +1,26 @@
+{
+  "id": "10_discrepancy_jpy",
+  "notes": "JPY proof but bank credited far less than expected — discrepancy.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 150000.00,
+    "currency": "JPY",
+    "date": "2026-05-11",
+    "payer": "Sakura Trading KK",
+    "payee": "BrightTech",
+    "reference": "INV-JP-201",
+    "source_file": "eval_10.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e10_a",
+      "date": "2026-05-11",
+      "amount": 3800.00,
+      "currency": "MYR",
+      "description": "INWARD SAKURA TRADING",
+      "reference": "INV-JP-201"
+    }
+  ],
+  "expected_decision": "discrepancy",
+  "expected_txn_id": "txn_e10_a"
+}

@@ -1,4 +1,11 @@
 data/treasury.db
 data/treasury.db-*
+data/treasury.db-shm
+data/treasury.db-wal
 data/inbox/*
 data/samples/*.pdf
+data/uploads/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc

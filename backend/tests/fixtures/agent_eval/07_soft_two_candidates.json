@@ -1,0 +1,34 @@
+{
+  "id": "07_soft_two_candidates",
+  "notes": "Two candidates same date, only one matches reference. Should pick the right one as strict.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 600.00,
+    "currency": "USD",
+    "date": "2026-05-19",
+    "payer": "TechFoundry",
+    "payee": "BrightTech",
+    "reference": "INV-2026-055",
+    "source_file": "eval_07.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e07_a",
+      "date": "2026-05-19",
+      "amount": 2817.84,
+      "currency": "MYR",
+      "description": "INWARD TECHFOUNDRY",
+      "reference": "INV-2026-055"
+    },
+    {
+      "id": "txn_e07_b",
+      "date": "2026-05-19",
+      "amount": 2817.84,
+      "currency": "MYR",
+      "description": "INWARD ANOTHER PAYER",
+      "reference": "INV-OTHER"
+    }
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_e07_a"
+}

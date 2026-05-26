@@ -1,0 +1,26 @@
+{
+  "id": "06_strict_sgd",
+  "notes": "SGD→MYR strict match. Tests multi-currency strict path.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 1200.00,
+    "currency": "SGD",
+    "date": "2026-05-08",
+    "payer": "Lion City Trading",
+    "payee": "BrightTech",
+    "reference": "INV-SG-101",
+    "source_file": "eval_06.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e06_a",
+      "date": "2026-05-08",
+      "amount": 4203.31,
+      "currency": "MYR",
+      "description": "INWARD LION CITY TRADING",
+      "reference": "INV-SG-101"
+    }
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_e06_a"
+}

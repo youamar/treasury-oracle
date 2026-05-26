@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 const STATUS_COLORS = {
   active: "bg-amber-100 text-amber-800",
@@ -9,12 +10,43 @@ const STATUS_COLORS = {
 export default function CampaignTracker({ seedProof }) {
   const [campaigns, setCampaigns] = useState([]);
   const [expanded, setExpanded] = useState(null);
+  const [workflows, setWorkflows] = useState({}); // cid -> snapshot
 
   async function refresh() {
     const r = await fetch("/api/campaign").then(r => r.json());
     setCampaigns(r.campaigns || []);
+    // Refresh known workflow snapshots
+    const next = { ...workflows };
+    await Promise.all((r.campaigns || []).map(async (c) => {
+      try {
+        const s = await fetch(`/api/campaign/${c.id}/workflow/state`);
+        if (s.ok) next[c.id] = await s.json();
+      } catch {}
+    }));
+    setWorkflows(next);
   }
   useEffect(() => { refresh(); }, []);
+
+  async function startWorkflow(cid) {
+    const r = await fetch(`/api/campaign/${cid}/workflow/start`, { method: "POST" });
+    if (r.ok) {
+      const snap = await r.json();
+      setWorkflows((w) => ({ ...w, [cid]: snap }));
+    }
+    refresh();
+  }
+  async function tickWorkflow(cid) {
+    await fetch(`/api/campaign/${cid}/workflow/tick`, { method: "POST" });
+    refresh();
+  }
+  async function stopWorkflow(cid) {
+    await fetch(`/api/campaign/${cid}/workflow/stop`, { method: "POST" });
+    refresh();
+  }
+  async function recoverWorkflow(cid) {
+    await fetch(`/api/campaign/${cid}/workflow/recover`, { method: "POST" });
+    refresh();
+  }
 
   async function start() {
     if (!seedProof) return;
@@ -90,6 +122,28 @@ export default function CampaignTracker({ seedProof }) {
                       </button>
                     </>
                   )}
+                  {workflows[c.id] ? (
+                    <>
+                      {!workflows[c.id].done && (
+                        <button onClick={() => tickWorkflow(c.id)}
+                                className="text-xs px-2 py-1 bg-purple-600 text-white rounded hover:bg-purple-700">
+                          ⏵ Tick
+                        </button>
+                      )}
+                      <button onClick={() => stopWorkflow(c.id)}
+                              className="text-xs px-2 py-1 bg-slate-500 text-white rounded hover:bg-slate-600">
+                        ⏹ Stop
+                      </button>
+                    </>
+                  ) : (
+                    c.status === "active" && (
+                      <button onClick={() => startWorkflow(c.id)}
+                              className="text-xs px-2 py-1 bg-purple-600 text-white rounded hover:bg-purple-700"
+                              title="Autonomous LangGraph workflow with SQLite checkpointer">
+                        🤖 Auto-run
+                      </button>
+                    )
+                  )}
                 </div>
               </div>
               {/* stage dots */}
@@ -101,6 +155,41 @@ export default function CampaignTracker({ seedProof }) {
                   }`} />
                 ))}
               </div>
+              {workflows[c.id] && (
+                <div className={`mt-2 border rounded p-2 text-[11px] ${
+                  workflows[c.id].status === "error"
+                    ? "bg-red-50 border-red-300"
+                    : "bg-purple-50 border-purple-200"
+                }`}>
+                  <div className="flex justify-between items-center">
+                    <span className={`font-semibold ${workflows[c.id].status === "error" ? "text-red-800" : "text-purple-800"}`}>
+                      🤖 Autonomous workflow
+                      {workflows[c.id].status === "error"
+                        ? " · ERROR"
+                        : workflows[c.id].done
+                          ? " · finished"
+                          : ` · paused before ${(workflows[c.id].interrupted_before || []).join(", ") || "next step"}`}
+                    </span>
+                    <span className={workflows[c.id].status === "error" ? "text-red-700" : "text-purple-600"}>
+                      iter {workflows[c.id].iterations} · stage {workflows[c.id].current_stage}
+                    </span>
+                  </div>
+                  {workflows[c.id].error_message && (
+                    <div className="mt-1 text-red-900 font-mono text-[10px]">{workflows[c.id].error_message}</div>
+                  )}
+                  {workflows[c.id].status === "error" && (
+                    <button onClick={() => recoverWorkflow(c.id)}
+                            className="mt-1 text-[10px] px-2 py-0.5 bg-red-600 text-white rounded hover:bg-red-700">
+                      🔄 Recover & retry
+                    </button>
+                  )}
+                  {workflows[c.id].log && workflows[c.id].log.length > 0 && (
+                    <ul className="mt-1 text-purple-700 list-disc list-inside">
+                      {workflows[c.id].log.slice(-4).map((l, i) => <li key={i}>{l}</li>)}
+                    </ul>
+                  )}
+                </div>
+              )}
               {expanded === c.id && (
                 <div className="mt-3 space-y-2">
                   {c.history.map((h, i) => (

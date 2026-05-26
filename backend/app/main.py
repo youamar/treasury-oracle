@@ -2,13 +2,14 @@
 import os
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+import hashlib
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from .ocr import extract_payment_proof, pdf_to_images
-from .parser import parse_bank_statement
+from .ocr import extract_payment_proof, pdf_to_images, extract_payment_proofs_batch
+from .parser import parse_bank_statement, parse_bank_statement_detailed
 from .matcher import reconcile as reconcile_classical
 from .agent import reconcile_agent
 from .report import build_report_pdf
@@ -19,8 +20,14 @@ from .fx_history import peak_analysis, what_if, watcher_check, get_fx_series
 from .validator import validate_submission
 from .audit_pack import build_audit_pack
 from .campaign import create_campaign, advance_campaign, mark_paid, list_campaigns
+from . import campaign_workflow as cwf
 from .documentary import documentary_narrative
 from . import db
+from . import skills as _skills  # noqa: F401 — registers all skills on import
+from .platform_api import router as platform_router
+from .memory_api import router as memory_router
+from .eval_api import router as eval_router
+from . import uploads as _uploads
 
 app = FastAPI(title="Global Treasury Agent", version="0.3.0")
 
@@ -32,6 +39,20 @@ def _startup():
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def tenant_scope_mw(request, call_next):
+    tenant = request.headers.get("x-tenant-id") or "default"
+    token = db._current_tenant.set(tenant)
+    try:
+        return await call_next(request)
+    finally:
+        db._current_tenant.reset(token)
+
+app.include_router(platform_router)
+app.include_router(memory_router)
+app.include_router(eval_router)
 
 INBOX_DIR = Path(__file__).resolve().parent.parent / "data" / "inbox"
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -54,30 +75,88 @@ def health(): return {"status": "ok"}
 
 @app.post("/api/extract-proofs")
 async def extract_proofs(files: list[UploadFile] = File(...)):
-    out = []
+    # Read all into memory once, then guardrail-check before processing.
+    blobs: list[tuple[str, bytes]] = []
     for f in files:
         data = await f.read()
         name = f.filename or "upload"
         try:
+            _uploads.validate_file(name, len(data), _uploads.ALLOWED_PROOF_EXTS)
+        except _uploads.UploadRejected as e:
+            raise HTTPException(e.status_code, e.reason)
+        blobs.append((name, data))
+    try:
+        _uploads.validate_batch([len(b) for _, b in blobs])
+    except _uploads.UploadRejected as e:
+        raise HTTPException(e.status_code, e.reason)
+
+    # Flatten everything to a list of (image_bytes, source_name, sha256) so
+    # we can OCR them all concurrently regardless of whether they came from
+    # standalone images or PDF page extraction.
+    ocr_items: list[tuple[bytes, str]] = []
+    sha_by_index: list[str | None] = []
+    errors: list[dict] = []
+    for name, data in blobs:
+        try:
+            rec = _uploads.store_bytes(name, data, purpose="proof")
+            sha = rec.get("sha256")
             if name.lower().endswith(".pdf"):
                 images = pdf_to_images(data)
                 for i, img in enumerate(images):
-                    out.append(extract_payment_proof(img, f"{name}#p{i+1}"))
+                    ocr_items.append((img, f"{name}#p{i+1}"))
+                    sha_by_index.append(sha)
             else:
-                out.append(extract_payment_proof(data, name))
+                ocr_items.append((data, name))
+                sha_by_index.append(sha)
         except Exception as e:
-            out.append({"source_file": name, "error": str(e)})
-    return {"proofs": out}
+            errors.append({"source_file": name, "error": str(e)})
+
+    proofs = await extract_payment_proofs_batch(ocr_items) if ocr_items else []
+    for p, sha in zip(proofs, sha_by_index):
+        p["source_sha256"] = sha
+    return {"proofs": proofs + errors}
 
 
 @app.post("/api/parse-statement")
-async def parse_statement(file: UploadFile = File(...)):
+async def parse_statement(file: UploadFile = File(...),
+                          bank: str = Query("default")):
     data = await file.read()
+    name = file.filename or "statement.csv"
     try:
-        txns = parse_bank_statement(data, file.filename or "statement.csv")
+        _uploads.validate_file(name, len(data), _uploads.ALLOWED_STATEMENT_EXTS)
+    except _uploads.UploadRejected as e:
+        raise HTTPException(e.status_code, e.reason)
+    try:
+        rec = _uploads.store_bytes(name, data, purpose="statement")
+        parsed = parse_bank_statement_detailed(data, name)
     except Exception as e:
+        from . import reliability as _rel
+        _rel.record_error("parse-statement", e, context={"filename": name})
         raise HTTPException(400, str(e))
-    return {"transactions": txns}
+
+    # F5: column drift — compare against the last successful parse for this
+    # (tenant, bank). Surface a warning before the operator hits Reconcile.
+    previous = db.get_column_mapping(bank)
+    drift = db.compute_column_drift(previous, parsed["headers"],
+                                    parsed["columns_detected"])
+    # Remember the current mapping for next time, unless drift is severe and
+    # we'd rather block the silent overwrite.
+    if drift["severity"] != "fields_moved":
+        db.remember_column_mapping(bank, parsed["headers"],
+                                   parsed["columns_detected"])
+
+    return {
+        "transactions": parsed["transactions"],
+        "skipped": parsed["skipped"],
+        "columns_detected": parsed["columns_detected"],
+        "headers": parsed["headers"],
+        "warnings": parsed["warnings"],
+        "row_count": parsed["row_count"],
+        "inbound_count": parsed["inbound_count"],
+        "outbound_count": parsed["outbound_count"],
+        "source_sha256": rec.get("sha256"),
+        "column_drift": drift,
+    }
 
 
 class ReconcileRequest(BaseModel):
@@ -87,16 +166,52 @@ class ReconcileRequest(BaseModel):
     mode: str = "agent"  # "agent" | "classical"
 
 
+def _request_hash(body: "ReconcileRequest") -> str:
+    """Stable hash of the meaningful inputs. Order-independent over txns/proofs
+    so re-uploading the same files in a different order is still a cache hit."""
+    canonical = {
+        "bank": body.bank,
+        "mode": body.mode,
+        "proofs": sorted(db.safe_dumps(p, sort_keys=True) for p in body.proofs),
+        "transactions": sorted(
+            db.safe_dumps(t, sort_keys=True) for t in body.transactions
+        ),
+    }
+    return hashlib.sha256(
+        db.safe_dumps(canonical, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 @app.post("/api/reconcile")
-async def reconcile_endpoint(body: ReconcileRequest):
+async def reconcile_endpoint(
+    body: ReconcileRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    # Idempotency: if the client sent a key and we've seen it before with the
+    # same body, return the cached session — no LLM tokens spent on a refresh.
+    req_hash = _request_hash(body) if idempotency_key else None
+    if idempotency_key:
+        try:
+            existing_recon_id = db.lookup_idempotency(idempotency_key, req_hash)
+        except db.IdempotencyConflict as e:
+            raise HTTPException(409, str(e))
+        if existing_recon_id:
+            cached = db.load_session(existing_recon_id)
+            if cached:
+                return {**cached, "idempotent_replay": True}
+
     if body.mode == "classical":
         result = reconcile_classical(body.proofs, body.transactions, body.bank)
         recon_id = str(uuid.uuid4())[:8]
         result["mode"] = "classical"
+        result["recon_id"] = recon_id
         db.save_session(recon_id, body.bank, result)
-        return {"recon_id": recon_id, **result}
-    # agent mode (default)
-    result = reconcile_agent(body.proofs, body.transactions, body.bank)
+    else:
+        result = reconcile_agent(body.proofs, body.transactions, body.bank)
+        recon_id = result.get("recon_id")
+
+    if idempotency_key and recon_id:
+        db.store_idempotency(idempotency_key, req_hash, recon_id)
     return result
 
 
@@ -128,18 +243,66 @@ class ConfirmSoftMatch(BaseModel):
     soft_match_id: int | None = None  # if provided, promote to strict match in DB
 
 
+def _capture_live_fixture_from_soft(soft_match_id: int, verdict: str):
+    """Find the soft match by id, snapshot it as a live fixture with the
+    operator's verdict so future eval runs include real-world labels."""
+    with db.conn() as c:
+        row = c.execute(
+            "SELECT sm.*, s.bank FROM soft_matches sm "
+            "JOIN sessions s ON s.id = sm.session_id "
+            "WHERE sm.id = ? AND sm.tenant_id = ?",
+            (soft_match_id, db.current_tenant()),
+        ).fetchone()
+    if not row:
+        return
+    import json as _json
+    proof = _json.loads(row["proof_json"])
+    txn = _json.loads(row["txn_json"])
+    expected_decision = "strict" if verdict == "confirm" else "no_match"
+    db.add_live_fixture(
+        fixture_id=f"live-{row['session_id']}-{soft_match_id}-{verdict}",
+        bank=row["bank"],
+        proof=proof,
+        txn_candidates=[txn],
+        expected_decision=expected_decision,
+        expected_txn_id=txn.get("id") if verdict == "confirm" else None,
+        source=f"soft_match_{verdict}",
+        session_id=row["session_id"],
+        notes=f"operator-{verdict}ed soft match {soft_match_id}",
+    )
+
+
 @app.post("/api/soft-match/confirm")
 def confirm_soft(body: ConfirmSoftMatch):
-    """User confirmed a soft match — remember the alias AND promote to strict match."""
+    """User confirmed a soft match — remember the alias, promote to strict
+    match, and snapshot the case as a live fixture for the eval pack."""
     remember_alias(body.canonical_payer, body.observed_in_txn)
     promoted = None
     if body.soft_match_id is not None:
         promoted = db.promote_soft_match(body.soft_match_id)
+        try:
+            _capture_live_fixture_from_soft(body.soft_match_id, "confirm")
+        except Exception:
+            pass  # fixture capture is observational
     return {
         "ok": True,
         "remembered": [body.canonical_payer, body.observed_in_txn],
         "session": promoted,
     }
+
+
+class RejectSoftMatch(BaseModel):
+    soft_match_id: int
+
+
+@app.post("/api/soft-match/reject")
+def reject_soft(body: RejectSoftMatch):
+    """Operator rejected a soft match — snapshot as a no_match live fixture."""
+    try:
+        _capture_live_fixture_from_soft(body.soft_match_id, "reject")
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 # ---------- dunning email ----------
@@ -319,6 +482,38 @@ def campaign_paid(cid: str):
         return mark_paid(cid)
     except KeyError:
         raise HTTPException(404, "campaign not found")
+
+
+# ---------- Autonomous LangGraph campaign workflow ----------
+
+@app.post("/api/campaign/{cid}/workflow/start")
+def campaign_workflow_start(cid: str):
+    if not db.get_campaign(cid):
+        raise HTTPException(404, "campaign not found")
+    return cwf.start(cid)
+
+
+@app.post("/api/campaign/{cid}/workflow/tick")
+def campaign_workflow_tick(cid: str):
+    return cwf.tick(cid)
+
+
+@app.get("/api/campaign/{cid}/workflow/state")
+def campaign_workflow_state(cid: str):
+    s = cwf.get_state(cid)
+    if s is None:
+        raise HTTPException(404, "workflow not started")
+    return s
+
+
+@app.post("/api/campaign/{cid}/workflow/stop")
+def campaign_workflow_stop(cid: str):
+    return cwf.stop(cid)
+
+
+@app.post("/api/campaign/{cid}/workflow/recover")
+def campaign_workflow_recover(cid: str):
+    return cwf.recover(cid)
 
 
 # ---------- Boss documentary ----------

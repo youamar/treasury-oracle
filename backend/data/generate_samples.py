@@ -83,17 +83,27 @@ print("Generating payment proofs...")
 for p in PROOFS:
     make_proof(p[0], p[1], PAYEE, p[2], p[3], p[4], p[5])
 
-# Bank statement (MYR account). Amounts use static rates from tools.py minus 0.5% fee.
+# Bank statement (MYR account). Amounts use static rates from tools.py minus 0.5% fee
+# PLUS deterministic micro-jitter so the demo doesn't show a suspicious 0.00% diff.
+# Real reconciliation always has noise — correspondent banks round, mid-market vs
+# ECB drifts intraday, fee schedules vary by tier. We seed the jitter so the
+# sample is reproducible but each row diverges from textbook math by a few bps.
+import random as _r
+_r.seed(42)
+def _jitter_pct() -> float:
+    # ±0.30% — under the F2 verifier's 0.50% strict ceiling but visibly non-zero.
+    return 1.0 + _r.uniform(-0.0030, 0.0030)
+
 # USD->MYR 4.72; EUR->MYR 5.10; SGD->MYR 3.52; GBP->MYR 5.95; JPY->MYR 0.031; CNY->MYR 0.65
 STATEMENT_ROWS = [
     # date, amount (MYR credit), ccy, description, reference
-    ("2026-05-20", round(1000 * 4.72 * 0.995, 2),  "MYR", "INWARD TT ACME CORP",          "INV-2026-001"),
-    ("2026-05-21", round( 850 * 5.10 * 0.995, 2),  "MYR", "INWARD TT BERLIN DESIGNS",     "INV-2026-002"),
-    ("2026-05-22", round( 500 * 3.52 * 0.995, 2),  "MYR", "INWARD TT SG HOLDINGS",        "INV-2026-003"),
-    ("2026-05-23", round( 300 * 5.95 * 0.995, 2),  "MYR", "INWARD TT LONDON MEDIA",       "INV-2026-004"),
-    ("2026-05-24", round(120000 * 0.031 * 0.995, 2),"MYR","INWARD TT TOKYO ROBOTICS",     "INV-2026-005"),
-    ("2026-05-24", round(3200 * 0.65 * 0.995, 2),  "MYR", "INWARD TT SHENZHEN HW",        "INV-2026-006"),
-    # mismatched amount for proof 7 (~10% off — should NOT match within 2% tolerance)
+    ("2026-05-20", round(1000 * 4.72 * 0.995 * _jitter_pct(), 2),  "MYR", "INWARD TT ACME CORP",          "INV-2026-001"),
+    ("2026-05-21", round( 850 * 5.10 * 0.995 * _jitter_pct(), 2),  "MYR", "INWARD TT BERLIN DESIGNS",     "INV-2026-002"),
+    ("2026-05-22", round( 500 * 3.52 * 0.995 * _jitter_pct(), 2),  "MYR", "INWARD TT SG HOLDINGS",        "INV-2026-003"),
+    ("2026-05-23", round( 300 * 5.95 * 0.995 * _jitter_pct(), 2),  "MYR", "INWARD TT LONDON MEDIA",       "INV-2026-004"),
+    ("2026-05-24", round(120000 * 0.031 * 0.995 * _jitter_pct(), 2),"MYR","INWARD TT TOKYO ROBOTICS",     "INV-2026-005"),
+    ("2026-05-24", round(3200 * 0.65 * 0.995 * _jitter_pct(), 2),  "MYR", "INWARD TT SHENZHEN HW",        "INV-2026-006"),
+    # mismatched amount for proof 7 (~15% off — should NOT match within 2% tolerance)
     ("2026-05-25", round( 500 * 4.72 * 0.995 * 0.85, 2), "MYR", "INWARD TT UNKNOWN PAYER", "MYS-999"),
     # orphan transaction with no proof
     ("2026-05-25", 1888.00, "MYR", "INWARD TT WALK-IN CUSTOMER", "WALKIN-001"),

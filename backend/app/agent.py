@@ -1,157 +1,283 @@
-"""ReconciliationAgent — real LLM-driven tool-calling loop.
+"""ReconciliationAgent — config-driven LLM tool-call loop over the skill registry.
 
-Per-proof flow:
-  1. Build a system prompt + user prompt containing the proof and candidate txns.
-  2. Call the LLM with TOOL_SCHEMAS attached.
-  3. Loop: if the model returns tool_calls, execute them, append the results, and
-     re-invoke. Otherwise parse the final JSON decision.
-  4. Every step is persisted to the agent_trace table — thoughts, actions, observations,
-     and the final decision — so the judges and auditors can replay the run.
-
-Design notes
-------------
-* Candidates are pre-filtered to those within ±5 days so we don't blow the context
-  window on irrelevant txns. The agent still has full freedom to reject every one.
-* Tool calls are bounded by MAX_STEPS to prevent loops on a confused model.
-* If the model fails to call tools or returns malformed JSON for MAX_STEPS rounds,
-  we fall back to the classical matcher for that proof and tag it as `fallback`.
-* The tool surface is intentionally small (4 tools) so a sub-frontier model
-  (Gemma-4-31B on Chutes) can stay coherent.
+The engine no longer hard-codes tools. It loads the enabled tool-kind skills
+from the platform config, exposes them to the LLM as function-call tools, and
+dispatches each call through SKILL_REGISTRY. Per-skill system_prompts are
+composed into the engine prompt so the customer can shape behavior without
+touching code.
 """
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime
 from typing import Any
 
 from .chutes_client import get_client
 from .config import REASONING_MODEL, MATCH_TOLERANCE
-from .tools import get_fx_rate, apply_bank_fee
-from .swift import trace_route
-from .fuzzy import soft_match_score
 from . import db
+from . import platform_config
+from . import reliability
+from . import calibration
+from .skills import (
+    SkillContext, SKILL_REGISTRY, enabled_tool_skills, resolve_skill_config,
+)
+from .config import BANK_FEES
 
 
-MAX_STEPS = 6  # safety cap on tool-call iterations per proof
+def _build_provenance(decision: dict, proof: dict, chosen: dict | None,
+                      bank: str) -> dict:
+    """Build a per-numeric provenance block for a match.
+
+    Every numeric field reported in the match output carries the source it
+    came from. This is what makes the audit pack defensible: every number
+    can be traced back to ECB / a bank-statement row / the OCR'd proof /
+    a config value / or 'agent_unverified' if the LLM made it up.
+    """
+    tool_calls = decision.get("tool_calls") or []
+    fx_calls = [tc for tc in tool_calls
+                if tc.get("name") == "get_fx_rate"
+                and isinstance(tc.get("result"), dict)]
+    fee_calls = [tc for tc in tool_calls
+                 if tc.get("name") == "apply_bank_fee"
+                 and isinstance(tc.get("result"), dict)]
+
+    # fx_rate
+    if fx_calls:
+        fx_res = fx_calls[-1]["result"]
+        fx_prov = {
+            "value": fx_res.get("rate"),
+            "source": fx_res.get("source"),
+            "asof": fx_res.get("asof"),
+            "trusted": bool(fx_res.get("trusted")),
+        }
+    else:
+        # LLM reported an fx_rate without calling the tool — unverified.
+        fx_prov = {
+            "value": decision.get("fx_rate"),
+            "source": "agent_unverified",
+            "trusted": False,
+        }
+
+    # fee
+    if fee_calls:
+        fee_res = fee_calls[-1]["result"]
+        fee_prov = {
+            "value": fee_res.get("fee_amount"),
+            "fee_pct": fee_res.get("fee_pct"),
+            "source": f"config:BANK_FEES.{fee_res.get('bank', bank)}",
+            "trusted": True,
+        }
+    else:
+        # Fall back to the config table directly so we still know where the
+        # number came from even if the LLM never invoked the skill.
+        cfg_pct = BANK_FEES.get(bank, BANK_FEES["default"])
+        fee_prov = {
+            "value": decision.get("fee_amount"),
+            "fee_pct": cfg_pct,
+            "source": (f"config:BANK_FEES.{bank}"
+                       if decision.get("fee_amount") is not None
+                       else "agent_unverified"),
+            "trusted": decision.get("fee_amount") is not None,
+        }
+
+    # actual_received — comes from the bank statement row
+    actual_prov = {
+        "value": (chosen or {}).get("amount"),
+        "source": f"bank_statement:{(chosen or {}).get('id')}" if chosen else None,
+        "trusted": True,
+    }
+
+    # proof amount — from OCR; carries the upload SHA when available
+    proof_prov = {
+        "value": proof.get("amount"),
+        "currency": proof.get("currency"),
+        "source": f"ocr:{proof.get('source_file')}",
+        "source_sha256": proof.get("source_sha256"),
+        "trusted": not bool(proof.get("error")),
+    }
+
+    # expected_net / gross — computed, with inputs pointing back at the
+    # provenance entries above so a reader can trace the calculation.
+    expected_gross_prov = {
+        "value": decision.get("fx_rate") and round(
+            (decision.get("fx_rate") or 0) * (proof.get("amount") or 0), 2
+        ),
+        "source": "computed",
+        "inputs": ["proof_amount", "fx_rate"],
+    }
+    expected_net_prov = {
+        "value": decision.get("expected_net"),
+        "source": "computed" if decision.get("expected_net") is not None else "agent_unverified",
+        "inputs": ["expected_gross", "fee_amount"],
+        "trusted": (fx_prov["trusted"] and fee_prov["trusted"]
+                    and decision.get("expected_net") is not None),
+    }
+
+    return {
+        "proof_amount": proof_prov,
+        "fx_rate": fx_prov,
+        "fee": fee_prov,
+        "expected_gross": expected_gross_prov,
+        "expected_net": expected_net_prov,
+        "actual_received": actual_prov,
+        # Overall: if any input is untrusted, the whole match is untrusted.
+        "all_inputs_trusted": (fx_prov["trusted"] and fee_prov["trusted"]
+                               and actual_prov["trusted"] and proof_prov["trusted"]),
+    }
+
+
+MAX_STEPS = 6
 DATE_WINDOW_DAYS = 5
+DEFAULT_AGENT_TEMPERATURE = 0.1   # production default
+EVAL_AGENT_TEMPERATURE = 0.0      # used during eval runs for reproducibility
+
+# Verifier (F2) — second-pass skeptic that audits the agent's proposed decision.
+# Currently deterministic (free, zero extra tokens); an LLM-backed verifier can
+# be plugged into the same hook later.
+VERIFIER_STRICT_DIFF_PCT = 0.005        # >0.5% diff is unusual for a 'strict' claim
+VERIFIER_STRICT_DAYS_OFF = 2            # date gap that should be a 'soft' not 'strict'
+VERIFIER_MIN_TOOL_CALLS_FOR_STRICT = 1  # an LLM jumping straight to strict is suspect
 
 
-# ---------- Tool surface exposed to the LLM ----------
-
-TOOLS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_fx_rate",
-            "description": (
-                "Fetch the historical foreign-exchange rate between two ISO 4217 "
-                "currency codes on a specific date. Returns the multiplier such "
-                "that amount_in_from * rate = amount_in_to."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "from_ccy": {"type": "string"},
-                    "to_ccy": {"type": "string"},
-                    "date": {"type": "string", "description": "YYYY-MM-DD"},
-                },
-                "required": ["from_ccy", "to_ccy", "date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_bank_fee",
-            "description": (
-                "Apply the local bank's inbound-conversion fee to a gross amount. "
-                "Returns fee_pct, fee_amount, and net_amount after the fee."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "amount": {"type": "number"},
-                    "bank_name": {"type": "string"},
-                },
-                "required": ["amount", "bank_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fuzzy_compare",
-            "description": (
-                "Compare a payment proof to a bank transaction using payer-name "
-                "similarity, invoice-reference overlap, and learned-alias memory. "
-                "Use this when the amount tier alone is ambiguous (e.g. amount "
-                "differs by more than the strict tolerance but other signals look "
-                "promising)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "proof_index": {"type": "integer"},
-                    "txn_index": {"type": "integer"},
-                },
-                "required": ["proof_index", "txn_index"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "trace_swift_route",
-            "description": (
-                "Infer the correspondent-bank routing chain when the actual amount "
-                "received is materially less than the expected net. Returns an "
-                "ordered list of route nodes with per-hop fee attribution."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source_currency": {"type": "string"},
-                    "sent_amount": {"type": "number"},
-                    "expected_net_local": {"type": "number"},
-                    "actual_net_local": {"type": "number"},
-                    "fx_rate": {"type": "number"},
-                    "local_currency": {"type": "string"},
-                },
-                "required": [
-                    "source_currency", "sent_amount", "expected_net_local",
-                    "actual_net_local", "fx_rate", "local_currency",
-                ],
-            },
-        },
-    },
-]
+def _payer_overlap(payer: str | None, txn_desc: str | None) -> bool:
+    """True if any payer word (len ≥ 3) appears in the bank narrative."""
+    if not payer or not txn_desc:
+        return False
+    desc_lower = txn_desc.lower()
+    return any(w for w in payer.lower().split() if len(w) >= 3 and w in desc_lower)
 
 
-# ---------- System prompt ----------
+def _reference_overlap(proof_ref: str | None, txn_ref: str | None,
+                       txn_desc: str | None) -> bool:
+    if not proof_ref:
+        return False
+    pr = proof_ref.strip().lower()
+    if txn_ref and pr in txn_ref.strip().lower():
+        return True
+    if txn_desc and pr in txn_desc.lower():
+        return True
+    return False
 
-SYSTEM_PROMPT = f"""You are a treasury reconciliation agent. For each payment proof,
-you must decide whether it matches one of the candidate bank transactions provided.
 
-You have four tools:
-  - get_fx_rate(from_ccy, to_ccy, date)
-  - apply_bank_fee(amount, bank_name)
-  - fuzzy_compare(proof_index, txn_index)
-  - trace_swift_route(...)
+def _verify_decision(decision: dict, proof: dict, chosen: dict | None,
+                     bank: str) -> dict:
+    """Deterministic skeptic pass. Returns:
 
-Standard procedure for each proof:
-  1. For the most plausible candidate txn (by date proximity), call get_fx_rate to
-     convert the proof amount into the bank's local currency.
-  2. Call apply_bank_fee on the converted amount.
-  3. Compare the resulting net to the candidate's actual amount.
-     * If |diff| / expected_net <= {MATCH_TOLERANCE:.2%}, decision = "strict".
-     * If diff is between {MATCH_TOLERANCE:.0%} and 15%, call fuzzy_compare to look
-       for non-numerical signals (name, invoice ref). If strong, decision = "soft".
-     * If diff > 15% AND actual < expected, call trace_swift_route to attribute
-       the gap. Decision = "discrepancy".
-     * If no candidate is plausible, decision = "no_match".
+        {
+          "ran": True,
+          "verdict": "confirm" | "downgrade" | "skip",
+          "concerns": [str, ...],
+          "method": "programmatic_skeptic_v1"
+        }
 
-When you have a decision, RESPOND WITH FINAL JSON (no tool call) in this exact shape:
+    For non-strict decisions it returns verdict='skip' (nothing to audit).
+    For strict decisions: any concern triggers verdict='downgrade'.
+    """
+    d = decision.get("decision")
+    if d != "strict" or chosen is None:
+        return {"ran": False, "verdict": "skip", "concerns": [],
+                "method": "programmatic_skeptic_v1"}
+
+    concerns: list[str] = []
+
+    # 1) Diff% larger than verifier's stricter ceiling — agent's 2% match
+    # tolerance may be config, but for a STRICT claim we want a much tighter fit.
+    expected = float(decision.get("expected_net") or 0)
+    actual = float(decision.get("actual") or chosen.get("amount") or 0)
+    if expected > 0:
+        diff_pct = abs(actual - expected) / expected
+        if diff_pct > VERIFIER_STRICT_DIFF_PCT:
+            concerns.append(
+                f"strict claimed but diff is {diff_pct*100:.2f}% — above "
+                f"verifier ceiling {VERIFIER_STRICT_DIFF_PCT*100:.2f}%"
+            )
+
+    # 2) Date gap — same-day payments are most likely strict; multi-day gaps
+    # commonly mean a fee/FX adjustment landed late, not a clean match.
+    try:
+        from datetime import date as _d
+        pd_ = _d.fromisoformat(proof.get("date"))
+        td_ = _d.fromisoformat(chosen.get("date"))
+        days_off = abs((pd_ - td_).days)
+        if days_off > VERIFIER_STRICT_DAYS_OFF:
+            concerns.append(
+                f"strict claimed but proof and txn are {days_off} days apart "
+                f"(verifier wants ≤{VERIFIER_STRICT_DAYS_OFF})"
+            )
+    except Exception:
+        pass
+
+    # 3) No supporting tool calls — LLM jumped straight to strict without
+    # actually calling get_fx_rate / fuzzy_compare. Hallucination risk.
+    tool_calls = decision.get("tool_calls") or []
+    n_substantive = sum(
+        1 for tc in tool_calls
+        if tc.get("name") in {"get_fx_rate", "apply_bank_fee", "fuzzy_compare"}
+    )
+    if n_substantive < VERIFIER_MIN_TOOL_CALLS_FOR_STRICT:
+        concerns.append(
+            f"strict claimed without any FX/fee/fuzzy tool call — "
+            f"agent answered from priors only"
+        )
+
+    # 4) Reference mismatch — if the proof has an invoice ref, the txn should
+    # mention it somewhere. Strict without ref-overlap is highly suspect.
+    if proof.get("reference") and not _reference_overlap(
+            proof.get("reference"), chosen.get("reference"),
+            chosen.get("description")):
+        concerns.append(
+            f"strict claimed but proof.reference={proof.get('reference')!r} "
+            f"not found in txn reference/description"
+        )
+
+    # 5) Payer / narrative mismatch — strict without any payer-name overlap
+    # is suspect unless reference matched (already checked above).
+    if proof.get("payer") and not _payer_overlap(proof.get("payer"),
+                                                 chosen.get("description")):
+        # Only escalate if reference ALSO didn't match (else we already
+        # know the reference is the bond).
+        if proof.get("reference") and _reference_overlap(
+                proof.get("reference"), chosen.get("reference"),
+                chosen.get("description")):
+            pass  # ref carries it
+        else:
+            concerns.append(
+                f"strict claimed but no payer-name overlap between "
+                f"{proof.get('payer')!r} and txn narrative"
+            )
+
+    return {
+        "ran": True,
+        "verdict": "downgrade" if concerns else "confirm",
+        "concerns": concerns,
+        "method": "programmatic_skeptic_v1",
+    }
+
+
+# ---------- Prompt assembly ----------
+
+_BASE_PROMPT = f"""You are a treasury reconciliation agent. For each payment proof,
+decide whether it matches one of the candidate bank transactions provided.
+
+Available tools are listed below — each tool has its own usage guidance.
+
+At the start of each proof, call recall_facts(subject=<payer>) and
+recall_facts(subject=<bank>) to surface anything the platform already learned.
+After the decision, if you discovered a stable pattern (e.g. a payer's
+preferred reference format, a bank's actual inbound fee), call remember_fact
+to persist it.
+
+Decision policy:
+  * If |diff| / expected_net <= {MATCH_TOLERANCE:.2%}, decision = "strict".
+  * If diff is between {MATCH_TOLERANCE:.0%} and 15%, call fuzzy_compare for
+    non-numerical signals. If strong, decision = "soft".
+  * If diff > 15% AND actual < expected, call trace_swift_route to attribute
+    the gap. decision = "discrepancy".
+  * If no candidate is plausible, decision = "no_match".
+
+When you have a decision, RESPOND WITH FINAL JSON (no tool call):
 
 {{
   "decision": "strict" | "soft" | "discrepancy" | "no_match",
@@ -169,10 +295,18 @@ When you have a decision, RESPOND WITH FINAL JSON (no tool call) in this exact s
 Be decisive. Do not call the same tool twice with identical arguments."""
 
 
+def _compose_system_prompt(tool_skills: list, platform_cfg: dict) -> str:
+    """Merge base prompt with per-skill usage guidance."""
+    sections = [_BASE_PROMPT, "", "Tool usage guidance:"]
+    for s in tool_skills:
+        sc = resolve_skill_config(s, platform_cfg)
+        sections.append(f"- {s.id}: {sc.get('system_prompt', '').strip()}")
+    return "\n".join(sections)
+
+
 # ---------- Helpers ----------
 
 def _candidate_txns(proof: dict, all_txns: list[dict], used_ids: set[str]) -> list[dict]:
-    """Filter to txns within the date window and not yet consumed."""
     pd = proof.get("date")
     if not pd:
         return [t for t in all_txns if t["id"] not in used_ids]
@@ -187,29 +321,6 @@ def _candidate_txns(proof: dict, all_txns: list[dict], used_ids: set[str]) -> li
         if days <= DATE_WINDOW_DAYS:
             out.append(t)
     return out
-
-
-def _dispatch(name: str, args: dict, proof: dict, candidates: list[dict]) -> Any:
-    """Execute a tool call. proof+candidates are passed in for index-based tools."""
-    if name == "get_fx_rate":
-        return {"rate": get_fx_rate(args["from_ccy"], args["to_ccy"], args["date"])}
-    if name == "apply_bank_fee":
-        return apply_bank_fee(args["amount"], args.get("bank_name", "default"))
-    if name == "fuzzy_compare":
-        ti = int(args["txn_index"])
-        if ti < 0 or ti >= len(candidates):
-            return {"error": f"txn_index {ti} out of range 0..{len(candidates)-1}"}
-        return soft_match_score(proof, candidates[ti])
-    if name == "trace_swift_route":
-        return trace_route(
-            source_currency=args["source_currency"],
-            sent_amount=float(args["sent_amount"]),
-            expected_net_local=float(args["expected_net_local"]),
-            actual_net_local=float(args["actual_net_local"]),
-            fx_rate=float(args["fx_rate"]),
-            local_currency=args.get("local_currency", "MYR"),
-        )
-    return {"error": f"unknown tool {name}"}
 
 
 def _build_user_prompt(proof: dict, candidates: list[dict], bank: str) -> str:
@@ -240,18 +351,43 @@ def _extract_final_json(content: str) -> dict | None:
         return None
 
 
+def _dispatch_skill(skill_id: str, args: dict, ctx: SkillContext) -> Any:
+    skill = SKILL_REGISTRY.get(skill_id)
+    if skill is None:
+        return {"error": f"unknown skill {skill_id}"}
+    try:
+        return skill.handler(ctx, **args)
+    except TypeError as e:
+        reliability.record_error(
+            "agent.dispatch_skill", e,
+            context={"skill_id": skill_id, "args": args, "reason": "bad_args"},
+        )
+        return {"error": f"bad args for {skill_id}: {e}"}
+    except Exception as e:
+        reliability.record_error(
+            "agent.dispatch_skill", e,
+            context={"skill_id": skill_id, "args": args},
+        )
+        return {"error": str(e)}
+
+
 # ---------- The agent loop ----------
 
 def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
-                   session_id: str, proof_idx: int) -> dict:
-    """Returns a normalized decision dict, with the agent's tool-call trace persisted."""
+                   session_id: str, proof_idx: int,
+                   platform_cfg: dict, tool_skills: list,
+                   temperature: float = DEFAULT_AGENT_TEMPERATURE) -> dict:
+    system_prompt = _compose_system_prompt(tool_skills, platform_cfg)
+    tool_specs = [s.to_openai_tool() for s in tool_skills]
+
     messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": _build_user_prompt(proof, candidates, bank)},
     ]
 
     db.append_trace(session_id, proof.get("source_file"), 0, "user_prompt",
-                    {"proof_index": proof_idx, "candidate_count": len(candidates)})
+                    {"proof_index": proof_idx, "candidate_count": len(candidates),
+                     "active_skills": [s.id for s in tool_skills]})
 
     client = get_client(False)
     step = 0
@@ -259,21 +395,43 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
 
     for _ in range(MAX_STEPS):
         step += 1
+        t0 = time.perf_counter()
         try:
-            resp = client.chat.completions.create(
-                model=REASONING_MODEL,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.1,
-                max_tokens=900,
-                timeout=30,
+            resp = reliability.with_retry(
+                lambda: client.chat.completions.create(
+                    model=REASONING_MODEL,
+                    messages=messages,
+                    tools=tool_specs,
+                    tool_choice="auto",
+                    temperature=temperature,
+                    max_tokens=900,
+                    timeout=30,
+                ),
+                source="agent.run_one_proof",
             )
         except Exception as e:
+            latency = (time.perf_counter() - t0) * 1000
             db.append_trace(session_id, proof.get("source_file"), step, "error",
                             {"message": str(e)})
+            db.record_metric(session_id, proof_index=proof_idx, step=step,
+                             latency_ms=latency, status="error")
+            reliability.record_error(
+                "agent.run_one_proof", e,
+                context={"session_id": session_id, "proof_index": proof_idx,
+                         "step": step},
+            )
             return {"decision": "error", "error": str(e), "fallback": True,
                     "tool_calls": tool_call_log}
+        latency = (time.perf_counter() - t0) * 1000
+        usage = getattr(resp, "usage", None)
+        tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+        tokens_out = getattr(usage, "completion_tokens", 0) or 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        tokens_cached = getattr(details, "cached_tokens", 0) or 0 if details else 0
+        db.record_metric(session_id, proof_index=proof_idx, step=step,
+                         tokens_in=tokens_in, tokens_out=tokens_out,
+                         tokens_cached=tokens_cached, latency_ms=latency,
+                         status="ok")
 
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None) or []
@@ -296,7 +454,23 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
                 db.append_trace(session_id, proof.get("source_file"), step,
                                 "tool_call", {"name": tc.function.name, "arguments": args})
 
-                result = _dispatch(tc.function.name, args, proof, candidates)
+                skill = SKILL_REGISTRY.get(tc.function.name)
+                skill_cfg = resolve_skill_config(skill, platform_cfg) if skill else {}
+                ctx = SkillContext(
+                    session_id=session_id,
+                    config=platform_cfg,
+                    skill_config=skill_cfg,
+                    extras={"proof": proof, "candidates": candidates, "bank": bank},
+                )
+                tt0 = time.perf_counter()
+                result = _dispatch_skill(tc.function.name, args, ctx)
+                tlat = (time.perf_counter() - tt0) * 1000
+                db.record_metric(
+                    session_id, proof_index=proof_idx, step=step,
+                    skill_id=tc.function.name, latency_ms=tlat,
+                    status=("error" if isinstance(result, dict) and result.get("error") else "ok"),
+                )
+
                 tool_call_log.append(
                     {"name": tc.function.name, "arguments": args, "result": result}
                 )
@@ -304,18 +478,16 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
                                 "tool_result", {"name": tc.function.name, "result": result})
                 messages.append({
                     "role": "tool", "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str),
+                    "content": db.safe_dumps(result),
                 })
             continue
 
-        # No tool call → final answer
         final = _extract_final_json(msg.content)
         if final is not None:
             db.append_trace(session_id, proof.get("source_file"), step,
                             "decision", final)
             final["tool_calls"] = tool_call_log
             return final
-        # Garbled output: nudge and retry
         db.append_trace(session_id, proof.get("source_file"), step, "parse_error",
                         {"raw": (msg.content or "")[:500]})
         messages.append({
@@ -335,9 +507,41 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
 # ---------- Public entry point ----------
 
 def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
-                    session_id: str | None = None) -> dict:
-    """Run the agentic reconciliation across all proofs and persist the session."""
+                    session_id: str | None = None,
+                    config_override: dict | None = None,
+                    temperature: float | None = None) -> dict:
+    """Run the agentic reconciliation across all proofs and persist the session.
+
+    If `config_override` is provided it replaces the loaded platform config for
+    this run only (useful for tests / per-tenant calls).
+
+    `temperature` overrides the LLM sampling temperature. Pass 0.0 for
+    deterministic eval runs. If None, the platform config's
+    `agent_temperature` is used, falling back to DEFAULT_AGENT_TEMPERATURE.
+    """
     sid = session_id or str(uuid.uuid4())[:8]
+    # Inbound payments only — outbound rows (refunds, fees) should never
+    # match against a payment proof. Rows lacking direction (legacy callers)
+    # are assumed inbound to preserve back-compat.
+    txns = [t for t in txns if t.get("direction", "in") == "in"]
+    platform_cfg = config_override or platform_config.load_config()
+    tool_skills = enabled_tool_skills(platform_cfg)
+    if not tool_skills:
+        # Defensive: surface this clearly rather than silently degrading.
+        return {"matches": [], "soft_matches": [], "unmatched_proofs": proofs,
+                "unmatched_txns": txns, "trace": ["No tool skills enabled."],
+                "summary": {"total_proofs": len(proofs), "total_txns": len(txns),
+                            "matched": 0, "soft_matches": 0,
+                            "unmatched_proofs": len(proofs),
+                            "unmatched_txns": len(txns)},
+                "mode": "agent", "error": "no_tool_skills_enabled"}
+
+    # Resolve effective temperature: explicit arg > config override > default.
+    if temperature is None:
+        cfg_temp = platform_cfg.get("agent_temperature")
+        temperature = (float(cfg_temp) if cfg_temp is not None
+                       else DEFAULT_AGENT_TEMPERATURE)
+
     used_ids: set[str] = set()
     matches: list[dict] = []
     soft_matches: list[dict] = []
@@ -351,6 +555,24 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
             classical_trace.append(f"SKIP {src} — unreadable")
             continue
 
+        # OCR quality gate: low-completeness proofs never reach the LLM agent.
+        # The agent would spend tokens guessing missing fields and likely
+        # produce a wrong-confident match. Far better to surface for review.
+        q = proof.get("ocr_quality") or {}
+        if q.get("gate") == "low_quality":
+            unmatched_proofs.append({
+                **proof,
+                "reason": (f"OCR quality below gate ({q.get('completeness')}); "
+                           f"missing: {', '.join(q.get('missing_fields') or [])}. "
+                           f"Needs human review."),
+                "needs_review": True,
+            })
+            classical_trace.append(
+                f"SKIP {src} — ocr_quality={q.get('completeness')} "
+                f"(missing {q.get('missing_fields')})"
+            )
+            continue
+
         candidates = _candidate_txns(proof, txns, used_ids)
         if not candidates:
             unmatched_proofs.append({**proof, "reason": "No bank transactions within date window"})
@@ -361,13 +583,59 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
             f"PROOF {src}: {proof['amount']} {proof['currency']} on {proof.get('date','?')} "
             f"({len(candidates)} candidates) — agent thinking…"
         )
-        decision = _run_one_proof(proof, candidates, bank, sid, pi)
+        decision = _run_one_proof(proof, candidates, bank, sid, pi,
+                                  platform_cfg, tool_skills,
+                                  temperature=temperature)
 
         d = decision.get("decision")
         ti = decision.get("txn_index")
         chosen = candidates[ti] if isinstance(ti, int) and 0 <= ti < len(candidates) else None
 
+        # Guardrail: if the agent based a strict decision on an untrusted FX
+        # source (static fallback or identity), downgrade to soft so the
+        # operator confirms. This catches both the case where the LLM ignored
+        # the trusted=false flag and the case where it never asked for a rate.
+        fx_results = [
+            tc.get("result", {}) for tc in (decision.get("tool_calls") or [])
+            if tc.get("name") == "get_fx_rate" and isinstance(tc.get("result"), dict)
+        ]
+        untrusted_fx = [r for r in fx_results if r.get("trusted") is False]
+        if d == "strict" and untrusted_fx:
+            classical_trace.append(
+                f"  [!] downgraded strict→soft: FX source "
+                f"{untrusted_fx[0].get('source')} not trusted for strict match"
+            )
+            d = "soft"
+            decision["decision"] = "soft"
+            decision.setdefault("fuzzy_signals", []).append(
+                f"fx_source={untrusted_fx[0].get('source')}"
+            )
+
+        # F2: second-pass verifier. Audits strict decisions for the common
+        # overconfidence patterns. Downgrades to soft if any concern fires.
+        verifier = _verify_decision(decision, proof, chosen, bank)
+        if verifier["verdict"] == "downgrade":
+            classical_trace.append(
+                f"  [!] verifier downgraded strict→soft: "
+                + "; ".join(verifier["concerns"])
+            )
+            d = "soft"
+            decision["decision"] = "soft"
+            decision.setdefault("fuzzy_signals", []).extend(
+                f"verifier:{c.split(' — ')[0]}" for c in verifier["concerns"]
+            )
+            db.append_trace(sid, proof.get("source_file"), 0, "verifier_downgrade",
+                            verifier)
+        elif verifier["ran"]:
+            db.append_trace(sid, proof.get("source_file"), 0, "verifier_confirm",
+                            verifier)
+
+        prov = _build_provenance(decision, proof, chosen, bank)
+        prov["verifier"] = verifier
+
         if d == "strict" and chosen:
+            raw_conf = float(decision.get("confidence") or 0.95)
+            cal_conf = calibration.apply(raw_conf)
             used_ids.add(chosen["id"])
             matches.append({
                 "proof": proof, "txn": chosen,
@@ -379,22 +647,28 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
                     "fee_pct": (decision.get("fee_amount") or 0) /
                                max((decision.get("fx_rate") or 0) * proof["amount"], 1e-6),
                     "fee_amount": decision.get("fee_amount") or 0,
+                    "provenance": prov,
                 },
-                "confidence": float(decision.get("confidence") or 0.95),
+                "confidence": cal_conf,
+                "confidence_raw": raw_conf,
                 "reasoning": decision.get("reasoning") or "Agent matched.",
                 "status": "matched",
                 "agent_tool_calls": decision.get("tool_calls", []),
             })
             classical_trace.append(f"  [OK] AGENT MATCHED → {chosen['id']}")
         elif d == "soft" and chosen:
+            raw_conf = float(decision.get("confidence") or 0.6)
+            cal_conf = calibration.apply(raw_conf)
             soft_matches.append({
                 "proof": proof, "txn": chosen,
                 "conversion": {
                     "fx_rate": decision.get("fx_rate") or 0,
                     "expected_net": decision.get("expected_net") or 0,
                     "actual_received": decision.get("actual") or chosen["amount"],
+                    "provenance": prov,
                 },
-                "confidence": float(decision.get("confidence") or 0.6),
+                "confidence": cal_conf,
+                "confidence_raw": raw_conf,
                 "signals": decision.get("fuzzy_signals") or [],
                 "reasoning": decision.get("reasoning") or "Soft match.",
                 "status": "soft_match_pending",
@@ -439,7 +713,11 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
         },
         "agent_trace": db.get_trace(sid),
         "mode": "agent",
+        "active_skills": [s.id for s in tool_skills],
+        "prompt_versions": platform_config.active_prompt_versions(platform_cfg),
     }
     db.save_session(sid, bank, result)
+    # Attach final telemetry after save so the response carries it back.
+    result["metrics"] = db.session_metrics(sid)
     result["recon_id"] = sid
     return result

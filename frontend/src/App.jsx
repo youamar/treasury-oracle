@@ -10,6 +10,10 @@ import FXWatcher from "./FXWatcher.jsx";
 import BossDocumentary from "./BossDocumentary.jsx";
 import CampaignTracker from "./CampaignTracker.jsx";
 import SalesValidator from "./SalesValidator.jsx";
+import Settings from "./Settings.jsx";
+import MemoryPanel from "./MemoryPanel.jsx";
+import EvalPanel from "./EvalPanel.jsx";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 const API = "/api";
 
@@ -38,11 +42,13 @@ export default function App() {
   const [stmtFile, setStmtFile] = useState(null);
   const [proofs, setProofs] = useState([]);
   const [txns, setTxns] = useState([]);
+  const [parseInfo, setParseInfo] = useState(null);  // {skipped, columns_detected, warnings, row_count}
   const [result, setResult] = useState(null);
   const [bank, setBank] = useState("Maybank");
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
   const [dunningTarget, setDunningTarget] = useState(null);
+  const [view, setView] = useState("recon"); // "recon" | "settings" | "memory"
 
   function appendProofs(newOnes) {
     setProofs((cur) => [...cur, ...newOnes]);
@@ -69,10 +75,20 @@ export default function App() {
     try {
       const fd = new FormData();
       fd.append("file", stmtFile);
-      const r = await fetch(`${API}/parse-statement`, { method: "POST", body: fd });
+      const r = await fetch(`${API}/parse-statement?bank=${encodeURIComponent(bank)}`,
+                            { method: "POST", body: fd });
       const j = await r.json();
       if (!r.ok) throw new Error(j.detail || "parse failed");
       setTxns(j.transactions || []);
+      setParseInfo({
+        skipped: j.skipped || [],
+        columns_detected: j.columns_detected || {},
+        warnings: j.warnings || [],
+        row_count: j.row_count || 0,
+        inbound_count: j.inbound_count || 0,
+        outbound_count: j.outbound_count || 0,
+        column_drift: j.column_drift || null,
+      });
     } catch (e) { setErr(String(e)); }
     setBusy("");
   }
@@ -81,15 +97,31 @@ export default function App() {
     if (!proofs.length || !txns.length) return;
     setBusy("Agent reconciling: FX lookups, fee calc, fuzzy matching, SWIFT trace...");
     setErr("");
+    // Stable idempotency key for THIS set of inputs — a tab refresh that
+    // re-submits the same proofs+txns will hit the cached recon_id instead
+    // of spending tokens again.
+    const idempKey = "recon-" + await sha256Short(
+      JSON.stringify({ bank, proofs, txns })
+    );
     try {
       const r = await fetch(`${API}/reconcile`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempKey,
+        },
         body: JSON.stringify({ proofs, transactions: txns, bank }),
       });
       setResult(await r.json());
     } catch (e) { setErr(String(e)); }
     setBusy("");
+  }
+
+  async function sha256Short(s) {
+    const buf = new TextEncoder().encode(s);
+    const hash = await crypto.subtle.digest("SHA-256", buf);
+    return Array.from(new Uint8Array(hash)).slice(0, 8)
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
   async function confirmSoftMatch(softMatch) {
@@ -135,11 +167,37 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <header className="bg-gradient-to-r from-blue-700 via-indigo-700 to-purple-700 text-white px-6 py-5 shadow">
-        <h1 className="text-2xl font-bold">🌍 Treasury Oracle</h1>
-        <p className="text-blue-100 text-sm">
-          Autonomous cross-border reconciliation · Vision OCR · Fuzzy matching · SWIFT tracing · Multilingual dunning
-        </p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold">🌍 Treasury Oracle <span className="text-blue-200 text-sm font-normal">— Skill Platform</span></h1>
+            <p className="text-blue-100 text-sm">
+              Composable treasury agent · Vision OCR · Fuzzy matching · SWIFT tracing · Multilingual dunning · Configurable per customer
+            </p>
+          </div>
+          <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
+            <button
+              onClick={() => setView("recon")}
+              className={`px-3 py-1 rounded ${view === "recon" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
+            >Reconcile</button>
+            <button
+              onClick={() => setView("memory")}
+              className={`px-3 py-1 rounded ${view === "memory" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
+            >Memory</button>
+            <button
+              onClick={() => setView("eval")}
+              className={`px-3 py-1 rounded ${view === "eval" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
+            >Eval</button>
+            <button
+              onClick={() => setView("settings")}
+              className={`px-3 py-1 rounded ${view === "settings" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
+            >Settings</button>
+          </nav>
+        </div>
       </header>
+      {view === "settings" && <Settings />}
+      {view === "memory" && <main className="max-w-6xl mx-auto p-6"><MemoryPanel /></main>}
+      {view === "eval" && <EvalPanel />}
+      {(view !== "recon") ? null : (
 
       <main className="max-w-6xl mx-auto p-6 space-y-6">
         {err && <div className="bg-red-100 text-red-800 p-3 rounded">{err}</div>}
@@ -157,14 +215,28 @@ export default function App() {
             </button>
             {proofs.length > 0 && (
               <ul className="mt-3 text-sm space-y-1 max-h-40 overflow-auto">
-                {proofs.map((p, i) => (
-                  <li key={i} className="border-b py-1">
-                    <span className="font-mono text-xs text-slate-500">{p.source_file}</span>{" "}
-                    {p.error ? <Pill color="red">error</Pill> : (
-                      <><Pill color="blue">{p.currency}</Pill> {p.amount} · {p.date} · {p.payer}</>
-                    )}
-                  </li>
-                ))}
+                {proofs.map((p, i) => {
+                  const q = p.ocr_quality || {};
+                  const lowQ = q.gate === "low_quality";
+                  return (
+                    <li key={i} className="border-b py-1">
+                      <span className="font-mono text-xs text-slate-500">{p.source_file}</span>{" "}
+                      {p.error ? <Pill color="red">error</Pill> : (
+                        <>
+                          <Pill color="blue">{p.currency}</Pill> {p.amount} · {p.date} · {p.payer}
+                          {lowQ && (
+                            <Pill color="amber">⚠ low quality {Math.round((q.completeness || 0) * 100)}%</Pill>
+                          )}
+                        </>
+                      )}
+                      {lowQ && q.missing_fields?.length > 0 && (
+                        <div className="text-[11px] text-amber-700 ml-1">
+                          missing: {q.missing_fields.join(", ")} · will be routed to review
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>
@@ -189,7 +261,74 @@ export default function App() {
             </button>
             {txns.length > 0 && (
               <div className="mt-3 text-sm text-slate-600">
-                Parsed <b>{txns.length}</b> inbound transactions.
+                Parsed <b>{txns.length}</b> inbound transactions
+                {parseInfo && parseInfo.row_count > 0 && (
+                  <span className="text-slate-500"> of <b>{parseInfo.row_count}</b> rows</span>
+                )}
+                {parseInfo && parseInfo.outbound_count > 0 && (
+                  <span className="text-slate-500"> · {parseInfo.outbound_count} outbound (kept, not matched)</span>
+                )}.
+                {parseInfo && parseInfo.skipped.length > 0 && (
+                  <details className="mt-2 text-xs bg-amber-50 border border-amber-200 rounded p-2">
+                    <summary className="cursor-pointer text-amber-800 font-medium">
+                      ⚠ {parseInfo.skipped.length} row{parseInfo.skipped.length !== 1 ? "s" : ""} skipped — click to inspect
+                    </summary>
+                    <ul className="mt-1 ml-3 space-y-0.5 max-h-40 overflow-auto">
+                      {parseInfo.skipped.slice(0, 50).map((s, i) => (
+                        <li key={i} className="font-mono text-[11px] text-amber-900">
+                          row {s.row_index}: {s.reason}
+                          {s.values && Object.keys(s.values).length > 0 && (
+                            <span className="text-amber-700"> — {JSON.stringify(s.values)}</span>
+                          )}
+                        </li>
+                      ))}
+                      {parseInfo.skipped.length > 50 && (
+                        <li className="text-amber-700">…and {parseInfo.skipped.length - 50} more</li>
+                      )}
+                    </ul>
+                  </details>
+                )}
+                {parseInfo && parseInfo.warnings.length > 0 && (
+                  <div className="mt-2 text-xs text-amber-700">
+                    {parseInfo.warnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
+                  </div>
+                )}
+                {parseInfo?.column_drift?.drift && (
+                  <div className={`mt-2 text-xs rounded p-2 border ${
+                    parseInfo.column_drift.severity === "fields_moved"
+                      ? "bg-red-50 border-red-300 text-red-900"
+                      : "bg-amber-50 border-amber-300 text-amber-900"
+                  }`}>
+                    <div className="font-semibold">
+                      {parseInfo.column_drift.severity === "fields_moved"
+                        ? "🚨 Critical column drift detected"
+                        : "⚠ Column layout changed since last upload"}
+                    </div>
+                    <div className="mt-1 text-[11px]">
+                      Last seen: {parseInfo.column_drift.previous_updated_at || "—"}
+                    </div>
+                    <ul className="mt-1 ml-3 space-y-0.5 font-mono text-[11px]">
+                      {parseInfo.column_drift.changes.map((c, i) => (
+                        <li key={i}>
+                          <b>{c.field}</b>: <span className="line-through opacity-60">
+                            {c.previous_column || "(none)"}
+                          </span> → {c.current_column || "(none)"} <i>[{c.kind}]</i>
+                        </li>
+                      ))}
+                    </ul>
+                    {parseInfo.column_drift.severity === "fields_moved" && (
+                      <div className="mt-1 text-[11px]">
+                        A critical field (date/amount) moved. Verify the parse before reconciling.
+                      </div>
+                    )}
+                  </div>
+                )}
+                {parseInfo && parseInfo.columns_detected && (
+                  <details className="mt-2 text-xs">
+                    <summary className="cursor-pointer text-slate-500">columns detected</summary>
+                    <pre className="mt-1 bg-slate-50 p-2 rounded text-[11px]">{JSON.stringify(parseInfo.columns_detected, null, 2)}</pre>
+                  </details>
+                )}
               </div>
             )}
           </div>
@@ -352,6 +491,7 @@ export default function App() {
           </section>
         )}
       </main>
+      )}
 
       {dunningTarget && (
         <DunningModal {...dunningTarget} onClose={() => setDunningTarget(null)} />

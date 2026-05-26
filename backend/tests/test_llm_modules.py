@@ -71,3 +71,45 @@ def test_campaign_lifecycle():
     assert c3["status"] == "paid"
 
     assert any(x["id"] == c["id"] for x in list_campaigns())
+
+
+def test_ocr_attaches_quality_score(monkeypatch):
+    """F9: every OCR result carries an ocr_quality block."""
+    import json
+    from app import ocr as ocr_mod
+
+    class _Resp:
+        class _M:
+            content = json.dumps({
+                "amount": 1000, "currency": "USD", "date": "2026-05-20",
+                "payer": "Acme", "payee": "BT", "reference": "INV-1", "description": "x",
+            })
+        choices = [type("C", (), {"message": _M})]
+    monkeypatch.setattr(ocr_mod, "chat", lambda *a, **k: _Resp())
+    monkeypatch.setattr(ocr_mod, "_normalize_image", lambda b: b)
+
+    out = ocr_mod.extract_payment_proof(b"\x89PNG fake", "p.png")
+    assert "ocr_quality" in out
+    assert out["ocr_quality"]["gate"] == "ok"
+    assert out["ocr_quality"]["completeness"] >= 0.9
+
+
+def test_ocr_quality_flags_missing_fields(monkeypatch):
+    """A response missing amount/payer/date should fall below the gate."""
+    import json
+    from app import ocr as ocr_mod
+
+    class _Resp:
+        class _M:
+            content = json.dumps({
+                "amount": None, "currency": "USD", "date": None,
+                "payer": None, "payee": None, "reference": None, "description": "blurry"
+            })
+        choices = [type("C", (), {"message": _M})]
+    monkeypatch.setattr(ocr_mod, "chat", lambda *a, **k: _Resp())
+    monkeypatch.setattr(ocr_mod, "_normalize_image", lambda b: b)
+
+    out = ocr_mod.extract_payment_proof(b"x", "blurry.png")
+    assert out["ocr_quality"]["gate"] == "low_quality"
+    assert "amount" in out["ocr_quality"]["missing_fields"]
+    assert "date" in out["ocr_quality"]["missing_fields"]

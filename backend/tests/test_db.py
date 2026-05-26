@@ -113,3 +113,123 @@ def test_agent_trace():
     t = db.get_trace("sidx")
     assert len(t) == 3
     assert t[1]["payload"]["name"] == "get_fx_rate"
+
+
+def test_safe_dumps_decimal_round_trips_as_float():
+    """R1: Decimal must come back as a number, not '4.72'."""
+    import json
+    from decimal import Decimal
+    from app import db
+
+    payload = {"rate": Decimal("4.72"), "qty": Decimal("100.0")}
+    blob = db.safe_dumps(payload)
+    restored = json.loads(blob)
+    assert restored["rate"] == 4.72
+    assert isinstance(restored["rate"], float)
+    assert isinstance(restored["qty"], float)
+
+
+def test_safe_dumps_datetime_and_uuid():
+    import json
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    from app import db
+
+    ts = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    uid = uuid4()
+    blob = db.safe_dumps({"ts": ts, "id": uid, "tags": {"a", "b"}})
+    restored = json.loads(blob)
+    assert restored["ts"].startswith("2026-05-26T12:00:00")
+    assert restored["id"] == str(uid)
+    assert sorted(restored["tags"]) == ["a", "b"]
+
+
+def test_safe_dumps_rejects_raw_bytes():
+    """Persisting raw bytes via JSON loses information silently — the
+    encoder must raise so the caller routes through raw_uploads instead."""
+    import pytest
+    from app import db
+
+    with pytest.raises(TypeError, match="bytes"):
+        db.safe_dumps({"blob": b"\x89PNG\r\n"})
+
+
+def test_eval_run_persists_numeric_decimals_intact():
+    """End-to-end: a Decimal that shows up in eval cases survives round-trip
+    through save_eval_run / get_eval_run as a number."""
+    from decimal import Decimal
+    from app import db
+
+    cases = [{"id": "c1", "expected_decision": "strict",
+              "predicted_decision": "strict",
+              "correct": True, "decision_correct": True,
+              "expected_txn_id": "x", "predicted_txn_id": "x",
+              "confidence": Decimal("0.93"),  # would have become "0.93" string before
+              "tool_call_count": 2,
+              "tokens_in": 100, "tokens_out": 40, "latency_ms": Decimal("123.4"),
+              "notes": ""}]
+    run_id = db.save_eval_run(
+        label="r1-test", config_snapshot={"x": Decimal("1.5")},
+        prompt_versions={}, metrics={"brier_score": Decimal("0.1")},
+        cases=cases, duration_ms=1.0,
+    )
+    loaded = db.get_eval_run(run_id)
+    assert loaded["cases"][0]["confidence"] == 0.93
+    assert isinstance(loaded["cases"][0]["confidence"], float)
+    assert loaded["metrics"]["brier_score"] == 0.1
+    assert loaded["config_snapshot"]["x"] == 1.5
+
+
+def test_pool_reuses_connection_within_thread():
+    """R2: conn() must return the same underlying connection on consecutive
+    calls from the same thread, so we don't pay the open cost per query."""
+    from app import db
+    with db.conn() as c1:
+        id1 = id(c1)
+    with db.conn() as c2:
+        id2 = id(c2)
+    assert id1 == id2
+
+
+def test_concurrent_writes_survive_under_pool():
+    """R2: previously this would intermittently raise 'database is locked'
+    once we crossed ~20 concurrent writers because each opened its own
+    fresh connection. With pooling + WAL + busy_timeout, all writers complete."""
+    import concurrent.futures
+    from app import db
+
+    N = 64
+
+    def writer(i: int) -> int:
+        return db.record_error(
+            source="r2-test", kind="x", message=f"m{i}",
+            context={"i": i}, traceback_text=None,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        rowids = list(ex.map(writer, range(N)))
+
+    assert len(rowids) == N
+    assert len(set(rowids)) == N  # every insert got its own rowid
+    errs = db.list_errors(source="r2-test", limit=N + 5)
+    assert len(errs) == N
+
+
+def test_pool_invalidates_when_db_path_changes(tmp_path, monkeypatch):
+    """When tests monkeypatch DB_PATH, the pooled connection must drop —
+    otherwise reads/writes leak into the previous test's DB file."""
+    from app import db
+    # Prime the pool against the test fixture's DB.
+    with db.conn() as c:
+        first_path = c.execute("PRAGMA database_list").fetchone()[2]
+
+    # Swap DB_PATH to a new file and verify the next conn() opens it.
+    new_db = tmp_path / "another.db"
+    monkeypatch.setattr(db, "DB_PATH", new_db)
+    monkeypatch.setattr(db, "_initialized", False)
+    db.init_db(new_db)
+    with db.conn() as c:
+        second_path = c.execute("PRAGMA database_list").fetchone()[2]
+
+    assert first_path != second_path
+    assert str(new_db) in second_path.replace("\\", "/") or second_path.endswith("another.db")

@@ -1,0 +1,24 @@
+{
+  "id": "08_unreadable_proof",
+  "notes": "Proof failed OCR — agent should skip cleanly with no_match.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": null,
+    "currency": null,
+    "date": null,
+    "error": "could not parse model output",
+    "source_file": "eval_08.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e08_a",
+      "date": "2026-05-12",
+      "amount": 1000.00,
+      "currency": "MYR",
+      "description": "INWARD UNKNOWN",
+      "reference": ""
+    }
+  ],
+  "expected_decision": "no_match",
+  "expected_txn_id": null
+}

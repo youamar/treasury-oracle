@@ -1,0 +1,26 @@
+{
+  "id": "05_no_match_no_candidates",
+  "notes": "Proof has no plausible candidate in the window — should return no_match.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 1500.00,
+    "currency": "USD",
+    "date": "2026-05-22",
+    "payer": "Northstar Inc",
+    "payee": "BrightTech",
+    "reference": "INV-2026-088",
+    "source_file": "eval_05.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e05_a",
+      "date": "2026-03-01",
+      "amount": 7080.00,
+      "currency": "MYR",
+      "description": "INWARD UNRELATED PAYER",
+      "reference": "INV-OLD-001"
+    }
+  ],
+  "expected_decision": "no_match",
+  "expected_txn_id": null
+}

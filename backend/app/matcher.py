@@ -55,6 +55,8 @@ def _score_pair(proof, txn, bank):
 
 
 def reconcile(proofs: list[dict], txns: list[dict], bank: str = "default") -> dict:
+    # Inbound only — outbound rows can't match a payment proof.
+    txns = [t for t in txns if t.get("direction", "in") == "in"]
     matches = []
     soft_matches = []        # need user confirmation
     unmatched_proofs = []

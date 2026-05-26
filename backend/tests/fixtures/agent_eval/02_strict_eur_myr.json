@@ -1,0 +1,26 @@
+{
+  "id": "02_strict_eur_myr",
+  "notes": "EUR→MYR strict match. Tests non-USD strict matching.",
+  "bank": "CIMB",
+  "proof": {
+    "amount": 500.00,
+    "currency": "EUR",
+    "date": "2026-05-12",
+    "payer": "MüllerHaus GmbH",
+    "payee": "BrightTech",
+    "reference": "INV-EU-77",
+    "source_file": "eval_02.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e02_a",
+      "date": "2026-05-12",
+      "amount": 2533.66,
+      "currency": "MYR",
+      "description": "INWARD MULLERHAUS",
+      "reference": "INV-EU-77"
+    }
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_e02_a"
+}

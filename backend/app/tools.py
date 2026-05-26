@@ -1,55 +1,124 @@
 """Agent tools: FX rate lookup and bank fee application."""
 import httpx
-from datetime import datetime
+from datetime import date as _date, datetime
 from functools import lru_cache
 from .config import BANK_FEES
 
 
-@lru_cache(maxsize=256)
-def get_fx_rate(from_ccy: str, to_ccy: str, date: str) -> float:
-    """
-    Fetch historical FX rate for a specific date.
-    date: ISO format YYYY-MM-DD
-    Returns: rate such that amount_from * rate = amount_to
-    """
-    from_ccy = from_ccy.upper()
-    to_ccy = to_ccy.upper()
-    if from_ccy == to_ccy:
-        return 1.0
+# Sources, ranked by trustworthiness. The agent must refuse strict-match on
+# anything below "ecb_live" — see agent.py decision policy.
+FX_SOURCE_ECB = "ecb_live"           # frankfurter.app (ECB)
+FX_SOURCE_EXR = "exchangerate_host"  # secondary live source
+FX_SOURCE_STATIC = "static_fallback" # baked-in table, stale
+FX_SOURCE_IDENTITY = "identity_fallback"  # 1.0 — no data at all
+FX_SOURCE_SAME = "same_currency"
 
-    # Try frankfurter.app (free, no key, ECB data)
+_TRUSTED_LIVE_SOURCES = {FX_SOURCE_ECB, FX_SOURCE_EXR, FX_SOURCE_SAME}
+
+
+_STATIC_RATES = {
+    ("USD", "MYR"): 4.72, ("EUR", "MYR"): 5.10, ("SGD", "MYR"): 3.52,
+    ("GBP", "MYR"): 5.95, ("JPY", "MYR"): 0.031, ("CNY", "MYR"): 0.65,
+    ("USD", "SGD"): 1.34, ("USD", "EUR"): 0.92, ("USD", "GBP"): 0.79,
+}
+
+
+@lru_cache(maxsize=256)
+def _fx_lookup_cached(from_ccy: str, to_ccy: str, date: str) -> tuple[float, str]:
+    """Returns (rate, source). Cached for historical dates only — callers must
+    bypass the cache for `date == today`."""
+    if from_ccy == to_ccy:
+        return 1.0, FX_SOURCE_SAME
+
     try:
         url = f"https://api.frankfurter.app/{date}?from={from_ccy}&to={to_ccy}"
         r = httpx.get(url, timeout=10)
         if r.status_code == 200:
             data = r.json()
             if "rates" in data and to_ccy in data["rates"]:
-                return float(data["rates"][to_ccy])
+                return float(data["rates"][to_ccy]), FX_SOURCE_ECB
     except Exception:
         pass
 
-    # Fallback: exchangerate.host
     try:
         url = f"https://api.exchangerate.host/{date}?base={from_ccy}&symbols={to_ccy}"
         r = httpx.get(url, timeout=10)
         if r.status_code == 200:
             data = r.json()
             if "rates" in data and to_ccy in data["rates"]:
-                return float(data["rates"][to_ccy])
+                return float(data["rates"][to_ccy]), FX_SOURCE_EXR
     except Exception:
         pass
 
-    # Last-resort static fallback rates so demo never breaks
-    STATIC_RATES = {
-        ("USD", "MYR"): 4.72, ("EUR", "MYR"): 5.10, ("SGD", "MYR"): 3.52,
-        ("GBP", "MYR"): 5.95, ("JPY", "MYR"): 0.031, ("CNY", "MYR"): 0.65,
-        ("USD", "SGD"): 1.34, ("USD", "EUR"): 0.92, ("USD", "GBP"): 0.79,
+    if (from_ccy, to_ccy) in _STATIC_RATES:
+        return _STATIC_RATES[(from_ccy, to_ccy)], FX_SOURCE_STATIC
+    if (to_ccy, from_ccy) in _STATIC_RATES:
+        return 1.0 / _STATIC_RATES[(to_ccy, from_ccy)], FX_SOURCE_STATIC
+    return 1.0, FX_SOURCE_IDENTITY
+
+
+def get_fx_rate_full(from_ccy: str, to_ccy: str, date: str) -> dict:
+    """Full provenance lookup. Returns:
+        {rate, source, trusted, stale, asof}
+    - `trusted`: safe for strict-match decisions
+    - `stale`: rate may not reflect today's market (static fallback or cache-bypassed today)
+    """
+    from_ccy = from_ccy.upper()
+    to_ccy = to_ccy.upper()
+    today = _date.today().isoformat()
+    if date == today:
+        # Do NOT use lru_cache for today — rates move intraday.
+        _fx_lookup_cached.cache_clear() if False else None  # no-op; we just bypass
+        rate, source = _fx_lookup_uncached(from_ccy, to_ccy, date)
+    else:
+        rate, source = _fx_lookup_cached(from_ccy, to_ccy, date)
+    return {
+        "rate": rate,
+        "source": source,
+        "trusted": source in _TRUSTED_LIVE_SOURCES,
+        "stale": source in {FX_SOURCE_STATIC, FX_SOURCE_IDENTITY},
+        "asof": date,
     }
-    if (from_ccy, to_ccy) in STATIC_RATES:
-        return STATIC_RATES[(from_ccy, to_ccy)]
-    if (to_ccy, from_ccy) in STATIC_RATES:
-        return 1.0 / STATIC_RATES[(to_ccy, from_ccy)]
-    return 1.0
+
+
+def _fx_lookup_uncached(from_ccy: str, to_ccy: str, date: str) -> tuple[float, str]:
+    """Same lookup as cached version, but never cached. Used for today's date."""
+    if from_ccy == to_ccy:
+        return 1.0, FX_SOURCE_SAME
+    try:
+        url = f"https://api.frankfurter.app/{date}?from={from_ccy}&to={to_ccy}"
+        r = httpx.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if "rates" in data and to_ccy in data["rates"]:
+                return float(data["rates"][to_ccy]), FX_SOURCE_ECB
+    except Exception:
+        pass
+    try:
+        url = f"https://api.exchangerate.host/{date}?base={from_ccy}&symbols={to_ccy}"
+        r = httpx.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if "rates" in data and to_ccy in data["rates"]:
+                return float(data["rates"][to_ccy]), FX_SOURCE_EXR
+    except Exception:
+        pass
+    if (from_ccy, to_ccy) in _STATIC_RATES:
+        return _STATIC_RATES[(from_ccy, to_ccy)], FX_SOURCE_STATIC
+    if (to_ccy, from_ccy) in _STATIC_RATES:
+        return 1.0 / _STATIC_RATES[(to_ccy, from_ccy)], FX_SOURCE_STATIC
+    return 1.0, FX_SOURCE_IDENTITY
+
+
+def get_fx_rate(from_ccy: str, to_ccy: str, date: str) -> float:
+    """Back-compat float wrapper. Prefer get_fx_rate_full for new callers so
+    you get provenance and can refuse to strict-match on stale data."""
+    return get_fx_rate_full(from_ccy, to_ccy, date)["rate"]
+
+
+# Preserve the .cache_clear() API tests relied on before the cache moved
+# into the underlying _fx_lookup_cached helper.
+get_fx_rate.cache_clear = _fx_lookup_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def apply_bank_fee(amount: float, bank_name: str = "default") -> dict:

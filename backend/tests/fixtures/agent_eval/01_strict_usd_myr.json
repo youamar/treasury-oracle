@@ -1,0 +1,34 @@
+{
+  "id": "01_strict_usd_myr",
+  "notes": "Clean USD→MYR strict match. Reference matches; amount within tolerance after FX + 0.5% Maybank fee.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 1000.00,
+    "currency": "USD",
+    "date": "2026-05-20",
+    "payer": "Acme Corp USA",
+    "payee": "BrightTech",
+    "reference": "INV-2026-001",
+    "source_file": "eval_01.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e01_a",
+      "date": "2026-05-20",
+      "amount": 4696.40,
+      "currency": "MYR",
+      "description": "INWARD TT ACME CORP",
+      "reference": "INV-2026-001"
+    },
+    {
+      "id": "txn_e01_b",
+      "date": "2026-05-18",
+      "amount": 230.00,
+      "currency": "MYR",
+      "description": "POS TERMINAL FEE",
+      "reference": ""
+    }
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_e01_a"
+}

@@ -1,0 +1,26 @@
+{
+  "id": "09_gbp_strict",
+  "notes": "GBP→MYR strict match. Tests GBP path with HSBC's 0.4% fee.",
+  "bank": "HSBC",
+  "proof": {
+    "amount": 750.00,
+    "currency": "GBP",
+    "date": "2026-05-14",
+    "payer": "London Tea Co",
+    "payee": "BrightTech",
+    "reference": "INV-GB-009",
+    "source_file": "eval_09.png"
+  },
+  "txn_candidates": [
+    {
+      "id": "txn_e09_a",
+      "date": "2026-05-14",
+      "amount": 4445.66,
+      "currency": "MYR",
+      "description": "INWARD LONDON TEA",
+      "reference": "INV-GB-009"
+    }
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_e09_a"
+}

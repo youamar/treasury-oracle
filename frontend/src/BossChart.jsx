@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 export default function BossChart({ match }) {
   const [data, setData] = useState(null);

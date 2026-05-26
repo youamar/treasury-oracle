@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { apiFetch as fetch } from "./Toast.jsx";
 
 const PAIRS = [["USD","MYR"], ["EUR","MYR"], ["SGD","MYR"], ["GBP","MYR"]];
 
