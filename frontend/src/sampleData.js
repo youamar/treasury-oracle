@@ -1,0 +1,83 @@
+// Pre-built demo dataset — lets users click "Try sample data" and skip the
+// OCR + parse steps to go straight to a reconciliation run. Mirrors what
+// backend/data/generate_samples.py would produce.
+
+export const SAMPLE_PROOFS = [
+  { source_file: "proof_01_usd.png", amount: 1000.00, currency: "USD",
+    date: "2026-05-20", payer: "Acme Corp (USA)", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-001", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  { source_file: "proof_02_eur.png", amount: 850.00, currency: "EUR",
+    date: "2026-05-21", payer: "Berlin Designs GmbH", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-002", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  { source_file: "proof_03_sgd.png", amount: 500.00, currency: "SGD",
+    date: "2026-05-22", payer: "Singapore Holdings Pte", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-003", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  { source_file: "proof_04_gbp.png", amount: 300.00, currency: "GBP",
+    date: "2026-05-22", payer: "London Media Ltd", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-004", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  { source_file: "proof_05_jpy.png", amount: 120000.00, currency: "JPY",
+    date: "2026-05-23", payer: "Tokyo Robotics KK", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-005", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  { source_file: "proof_06_cny.png", amount: 3200.00, currency: "CNY",
+    date: "2026-05-23", payer: "Shenzhen Hardware Co", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-006", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  // discrepancy — amount on bank statement is ~15% off
+  { source_file: "proof_07_usd_disc.png", amount: 500.00, currency: "USD",
+    date: "2026-05-24", payer: "MysteryCo LLC", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-007", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+  // soft match — personal account paying a business invoice
+  { source_file: "proof_08_soft.png", amount: 800.00, currency: "USD",
+    date: "2026-05-25", payer: "Wei Ming Tan (Personal)", payee: "BrightTech Sdn Bhd",
+    reference: "INV-2026-008", description: "International Transfer",
+    ocr_quality: { completeness: 1.0, missing_fields: [], gate: "ok" } },
+];
+
+// Bank statement (MYR) — jittered ±0.30% from textbook, matches generate_samples.py
+export const SAMPLE_TXNS = [
+  { id: "txn_0", date: "2026-05-20", amount: 4700.33, signed_amount: 4700.33,
+    direction: "in", currency: "MYR", description: "INWARD TT ACME CORP",
+    reference: "INV-2026-001" },
+  { id: "txn_1", date: "2026-05-21", amount: 4301.03, signed_amount: 4301.03,
+    direction: "in", currency: "MYR", description: "INWARD TT BERLIN DESIGNS",
+    reference: "INV-2026-002" },
+  { id: "txn_2", date: "2026-05-22", amount: 1748.84, signed_amount: 1748.84,
+    direction: "in", currency: "MYR", description: "INWARD TT SG HOLDINGS",
+    reference: "INV-2026-003" },
+  { id: "txn_3", date: "2026-05-23", amount: 1773.13, signed_amount: 1773.13,
+    direction: "in", currency: "MYR", description: "INWARD TT LONDON MEDIA",
+    reference: "INV-2026-004" },
+  { id: "txn_4", date: "2026-05-24", amount: 3706.65, signed_amount: 3706.65,
+    direction: "in", currency: "MYR", description: "INWARD TT TOKYO ROBOTICS",
+    reference: "INV-2026-005" },
+  { id: "txn_5", date: "2026-05-24", amount: 2071.79, signed_amount: 2071.79,
+    direction: "in", currency: "MYR", description: "INWARD TT SHENZHEN HW",
+    reference: "INV-2026-006" },
+  { id: "txn_6", date: "2026-05-25", amount: 1995.97, signed_amount: 1995.97,
+    direction: "in", currency: "MYR", description: "INWARD TT UNKNOWN PAYER",
+    reference: "MYS-999" },
+  { id: "txn_7", date: "2026-05-25", amount: 1888.00, signed_amount: 1888.00,
+    direction: "in", currency: "MYR", description: "INWARD TT WALK-IN CUSTOMER",
+    reference: "WALKIN-001" },
+  { id: "txn_8", date: "2026-05-25", amount: 3456.55, signed_amount: 3456.55,
+    direction: "in", currency: "MYR",
+    description: "INWARD TT ACME GLOBAL HOLDINGS REF INV-2026-008",
+    reference: "INV-2026-008" },
+];
+
+export const SAMPLE_PARSE_INFO = {
+  skipped: [],
+  columns_detected: { date: "Date", amount: "Amount", currency: "Currency",
+                      description: "Description", reference: "Reference" },
+  warnings: [],
+  row_count: 9,
+  inbound_count: 9,
+  outbound_count: 0,
+  column_drift: { drift: false, severity: "none", changes: [], is_first_seen: true },
+};

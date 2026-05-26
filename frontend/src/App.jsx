@@ -14,6 +14,7 @@ import Settings from "./Settings.jsx";
 import MemoryPanel from "./MemoryPanel.jsx";
 import EvalPanel from "./EvalPanel.jsx";
 import { apiFetch as fetch, pushToast } from "./Toast.jsx";
+import { SAMPLE_PROOFS, SAMPLE_TXNS, SAMPLE_PARSE_INFO } from "./sampleData.js";
 
 const API = "/api";
 
@@ -52,6 +53,25 @@ export default function App() {
 
   function appendProofs(newOnes) {
     setProofs((cur) => [...cur, ...newOnes]);
+  }
+
+  function loadSampleData() {
+    setProofs(SAMPLE_PROOFS);
+    setTxns(SAMPLE_TXNS);
+    setParseInfo(SAMPLE_PARSE_INFO);
+    setBank("Maybank");
+    setResult(null);
+    pushToast({
+      kind: "ok",
+      title: "Sample data loaded",
+      message: `${SAMPLE_PROOFS.length} proofs · ${SAMPLE_TXNS.length} bank rows. Hit Run Agent.`,
+    });
+  }
+
+  function clearAll() {
+    setProofs([]); setTxns([]); setParseInfo(null); setResult(null);
+    setProofFiles([]); setStmtFile(null);
+    pushToast({ kind: "ok", title: "Cleared", message: "Workspace reset." });
   }
 
   async function runOCR() {
@@ -255,6 +275,35 @@ export default function App() {
       {(view !== "recon") ? null : (
 
       <main className="max-w-6xl mx-auto p-6 space-y-6">
+        {/* First-run helper banner — only shown when workspace is empty */}
+        {proofs.length === 0 && txns.length === 0 && (
+          <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 rounded-xl p-4 flex items-center justify-between gap-4 flex-wrap">
+            <div>
+              <div className="font-semibold text-indigo-900">👋 First time here?</div>
+              <div className="text-sm text-indigo-700">
+                Click <b>Try sample data</b> to skip the upload steps and see the agent in action with 8 pre-built payment proofs + a sample bank statement.
+              </div>
+            </div>
+            <button onClick={loadSampleData}
+                    className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 font-medium whitespace-nowrap">
+              🎬 Try sample data
+            </button>
+          </div>
+        )}
+        {(proofs.length > 0 || txns.length > 0) && (
+          <div className="flex items-center justify-end gap-2 text-sm">
+            <button onClick={loadSampleData}
+                    className="text-indigo-700 hover:text-indigo-900 underline">
+              reload sample data
+            </button>
+            <span className="text-slate-400">·</span>
+            <button onClick={clearAll}
+                    className="text-slate-500 hover:text-red-600 underline">
+              clear workspace
+            </button>
+          </div>
+        )}
+
         <section className="grid md:grid-cols-2 gap-4">
           <div className="bg-white p-5 rounded-xl shadow">
             <h2 className="font-semibold mb-3">1. Payment Proofs</h2>
@@ -300,6 +349,31 @@ export default function App() {
               label={stmtFile ? stmtFile.name : "Drop CSV / XLSX bank statement"}
               accept=".csv,.xlsx,.xls" onFiles={(f) => setStmtFile(f[0])}
             />
+            <details className="mt-2 text-xs text-slate-600">
+              <summary className="cursor-pointer hover:text-slate-900">
+                what should the file look like?
+              </summary>
+              <div className="mt-2 bg-slate-50 border border-slate-200 rounded p-2">
+                <div className="text-[11px] mb-1">Headers we recognize (any of):</div>
+                <ul className="ml-4 list-disc text-[11px] space-y-0.5">
+                  <li><b>Date</b> · Transaction Date · Posting Date · Value Date</li>
+                  <li><b>Amount</b> · Credit · Credit Amount · Deposit</li>
+                  <li>Currency · CCY <span className="text-slate-400">(optional, defaults to MYR)</span></li>
+                  <li>Description · Narrative · Memo <span className="text-slate-400">(optional)</span></li>
+                  <li>Reference · Ref · Txn ID <span className="text-slate-400">(optional)</span></li>
+                </ul>
+                <div className="text-[11px] mt-2">Sample CSV:</div>
+                <pre className="mt-1 bg-white border border-slate-200 rounded p-1 text-[10px] overflow-x-auto">
+{`Date,Amount,Currency,Description,Reference
+2026-05-20,4700.33,MYR,INWARD TT ACME CORP,INV-2026-001
+2026-05-21,4301.03,MYR,INWARD TT BERLIN DESIGNS,INV-2026-002`}
+                </pre>
+                <button onClick={loadSampleData}
+                        className="mt-2 text-indigo-600 hover:text-indigo-800 underline text-[11px]">
+                  Don't have a file? Load the sample data instead →
+                </button>
+              </div>
+            </details>
             <div className="mt-3 flex gap-2 items-center">
               <label className="text-sm text-slate-600">Bank:</label>
               <select value={bank} onChange={(e) => setBank(e.target.value)}
@@ -402,17 +476,43 @@ export default function App() {
         <section className="bg-white p-5 rounded-xl shadow">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <h2 className="font-semibold">3. Reconcile</h2>
-            <div className="flex gap-2">
+            <div className="flex gap-2 items-center">
               <button onClick={monthEndClose} disabled={busy}
                       className="bg-slate-900 text-white px-4 py-2 rounded disabled:opacity-40 hover:bg-slate-700">
                 🌙 Month-End Close
               </button>
               <button disabled={!proofs.length || !txns.length || busy} onClick={runReconcile}
+                      title={
+                        !proofs.length && !txns.length ? "Load proofs and a bank statement first (or click Try sample data)" :
+                        !proofs.length ? "Extract payment proofs first" :
+                        !txns.length ? "Parse a bank statement first" :
+                        busy ? "Running…" : "Run the agent"
+                      }
                       className="bg-indigo-600 text-white px-5 py-2 rounded disabled:opacity-40 hover:bg-indigo-700">
                 ⚡ Run Agent
               </button>
             </div>
           </div>
+          {/* Inline checklist — replaces the silent disabled state */}
+          {(!proofs.length || !txns.length) && !busy && (
+            <div className="mt-3 text-sm bg-amber-50 border border-amber-200 rounded p-2">
+              <div className="font-medium text-amber-900 mb-1">
+                Before you can run the agent:
+              </div>
+              <ul className="text-xs space-y-0.5">
+                <li className={proofs.length ? "text-emerald-700" : "text-amber-800"}>
+                  {proofs.length ? "✓" : "○"} Payment proofs ({proofs.length} loaded)
+                </li>
+                <li className={txns.length ? "text-emerald-700" : "text-amber-800"}>
+                  {txns.length ? "✓" : "○"} Bank statement transactions ({txns.length} loaded)
+                </li>
+              </ul>
+              <button onClick={loadSampleData}
+                      className="mt-2 text-xs text-indigo-700 hover:text-indigo-900 underline">
+                or skip the upload steps →
+              </button>
+            </div>
+          )}
           {busy && (
             <div className="mt-3">
               <div className="text-sm text-blue-700 flex items-center gap-2">
