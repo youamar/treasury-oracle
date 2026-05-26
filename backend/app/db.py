@@ -464,6 +464,12 @@ def init_db(path: Path | None = None):
                 ("default", "Default Tenant", _now()),
             )
             c.commit()
+        # Auth schema lives in a sibling module to keep its concerns isolated.
+        try:
+            from . import auth as _auth
+            _auth.init_auth_schema()
+        except Exception:
+            pass
         _initialized = True
         # If callers switched DB_PATH (tests do this), drop pooled connections
         # so the next conn() opens against the new file.

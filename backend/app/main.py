@@ -36,6 +36,8 @@ from . import uploads as _uploads
 async def lifespan(app: FastAPI):
     # Startup
     db.init_db()
+    from . import auth as _auth
+    _auth.init_auth_schema()
     yield
     # Shutdown
     db.reset_pool()
@@ -66,8 +68,23 @@ _rate_windows: dict[tuple[str, str], deque] = {}
 
 @app.middleware("http")
 async def request_scope_mw(request: Request, call_next):
-    # Tenant context for this request.
-    tenant = request.headers.get("x-tenant-id") or "default"
+    # Tenant context for this request. Prefer the verified bearer token
+    # (cryptographically authoritative) over the client-supplied
+    # x-tenant-id header. Without a token, fall back to the header for
+    # backwards compatibility with unauthenticated paths (health, public
+    # endpoints, the dev workflow before login is wired everywhere).
+    from . import auth as _auth
+    auth_hdr = request.headers.get("Authorization") or ""
+    tenant: str | None = None
+    if auth_hdr.startswith("Bearer "):
+        try:
+            payload = _auth.verify_token(auth_hdr.split(" ", 1)[1])
+            tenant = payload.get("tid")
+        except _auth.AuthError:
+            pass  # invalid token — fall through to header / default
+    if tenant is None:
+        tenant = request.headers.get("x-tenant-id") or "default"
+
     token = db._current_tenant.set(tenant)
 
     # Rate limit check (only on configured endpoints).
@@ -119,6 +136,55 @@ def _safe_inbox_path(filename: str) -> Path:
 
 @app.get("/health")
 def health(): return {"status": "ok"}
+
+
+# ---------- auth ----------
+
+class _AuthBody(BaseModel):
+    email: str
+    password: str
+    display_name: str | None = None
+
+
+@app.post("/api/auth/register")
+def auth_register(body: _AuthBody):
+    from . import auth as _auth
+    try:
+        return _auth.register_user(body.email, body.password, body.display_name)
+    except _auth.AuthError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/auth/login")
+def auth_login(body: _AuthBody):
+    from . import auth as _auth
+    try:
+        return _auth.login(body.email, body.password)
+    except _auth.AuthError as e:
+        raise HTTPException(401, str(e))
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    from . import auth as _auth
+    hdr = request.headers.get("Authorization") or ""
+    if not hdr.startswith("Bearer "):
+        raise HTTPException(401, "missing bearer token")
+    try:
+        payload = _auth.verify_token(hdr.split(" ", 1)[1])
+    except _auth.AuthError as e:
+        raise HTTPException(401, str(e))
+    user = _auth.get_user_by_id(payload["uid"])
+    if user is None:
+        raise HTTPException(401, "user no longer exists")
+    return {
+        "user_id": user["id"],
+        "tenant_id": user["tenant_id"],
+        "email": user["email"],
+        "display_name": user["display_name"],
+        "role": user["role"],
+        "token_expires_at": payload["exp"],
+    }
 
 
 # ---------- maintenance ----------

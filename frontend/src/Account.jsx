@@ -4,14 +4,12 @@ import { pushToast } from "./Toast.jsx";
 // localStorage keys
 const LS_TENANT = "to_tenant_id";
 const LS_EMAIL  = "to_email";
+const LS_TOKEN  = "to_token";
 const LS_ONBOARDED = "to_onboarded";
 
-export function getTenant() {
-  return localStorage.getItem(LS_TENANT) || null;
-}
-export function getEmail() {
-  return localStorage.getItem(LS_EMAIL) || null;
-}
+export function getTenant() { return localStorage.getItem(LS_TENANT) || null; }
+export function getEmail()  { return localStorage.getItem(LS_EMAIL)  || null; }
+export function getToken()  { return localStorage.getItem(LS_TOKEN)  || null; }
 export function isOnboarded() {
   return localStorage.getItem(LS_ONBOARDED) === "1";
 }
@@ -22,55 +20,77 @@ export function markOnboarded() {
 export function signOut() {
   localStorage.removeItem(LS_TENANT);
   localStorage.removeItem(LS_EMAIL);
+  localStorage.removeItem(LS_TOKEN);
   localStorage.removeItem(LS_ONBOARDED);
   window.dispatchEvent(new Event("to-account-changed"));
 }
 
-/** Subscribe to account changes (sign-in, sign-out, onboarded). */
 export function onAccountChange(cb) {
   window.addEventListener("to-account-changed", cb);
   return () => window.removeEventListener("to-account-changed", cb);
 }
 
 
-/** Login / sign-up screen. Email-only — backend creates a tenant scoped to
- *  the email's slug. No password yet; this is the demo path. */
+/** Real-auth sign-in / sign-up screen. Single 'submit' tries login first;
+ *  on 401, offers to register with the same credentials. Issues a signed
+ *  bearer token that apiFetch sends on every subsequent request. */
 export default function Account({ onAuthed }) {
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [mode, setMode] = useState("login");  // "login" | "register"
   const [busy, setBusy] = useState(false);
 
-  function tenantIdFromEmail(e) {
-    // Slug the email so tenant ids are URL-safe + readable.
-    return e.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  function persist(result) {
+    localStorage.setItem(LS_TENANT, result.tenant_id);
+    localStorage.setItem(LS_EMAIL, result.email);
+    localStorage.setItem(LS_TOKEN, result.token);
+    window.dispatchEvent(new Event("to-account-changed"));
+    onAuthed?.(result.tenant_id);
   }
 
   async function submit(e) {
     e?.preventDefault();
-    const trimmed = email.trim();
-    if (!trimmed || !/.+@.+\..+/.test(trimmed)) {
+    const em = email.trim();
+    if (!/.+@.+\..+/.test(em)) {
       pushToast({ kind: "error", title: "Invalid email",
                   message: "Enter a real email address." });
       return;
     }
+    if (password.length < 8) {
+      pushToast({ kind: "error", title: "Password too short",
+                  message: "Use at least 8 characters." });
+      return;
+    }
     setBusy(true);
-    const tenant = tenantIdFromEmail(trimmed);
     try {
-      // Upsert tenant on the backend. Header is sent so the new tenant
-      // is also scoped correctly from the start.
-      const r = await fetch("/api/memory/tenants", {
+      const r = await fetch(`/api/auth/${mode}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-tenant-id": tenant },
-        body: JSON.stringify({ id: tenant, name: trimmed.split("@")[0] }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: em, password }),
       });
-      if (!r.ok) throw new Error(await r.text());
-      localStorage.setItem(LS_TENANT, tenant);
-      localStorage.setItem(LS_EMAIL, trimmed);
-      window.dispatchEvent(new Event("to-account-changed"));
-      pushToast({ kind: "ok", title: "Signed in",
-                  message: `Welcome, ${trimmed}` });
-      onAuthed?.(tenant);
+      const j = await r.json();
+      if (!r.ok) {
+        // Helpful nudge: failed login often means "you haven't registered yet".
+        if (mode === "login" && r.status === 401) {
+          pushToast({
+            kind: "warn", title: "Login failed",
+            message: "No account yet? Switch to Sign up below.",
+          });
+        } else {
+          pushToast({ kind: "error", title: "Auth failed",
+                      message: j.detail || `HTTP ${r.status}` });
+        }
+        setBusy(false);
+        return;
+      }
+      persist(j);
+      pushToast({
+        kind: "ok",
+        title: mode === "register" ? "Account created" : "Signed in",
+        message: `Welcome, ${j.email}`,
+      });
     } catch (err) {
-      pushToast({ kind: "error", title: "Sign-in failed",
+      pushToast({ kind: "error", title: "Network error",
                   message: String(err?.message || err) });
     }
     setBusy(false);
@@ -87,42 +107,50 @@ export default function Account({ onAuthed }) {
           </div>
         </div>
 
+        {/* mode toggle */}
+        <div className="flex bg-slate-100 rounded-lg p-1 mb-4 text-sm">
+          {["login", "register"].map((m) => (
+            <button key={m} type="button" onClick={() => setMode(m)}
+              className={`flex-1 py-1.5 rounded transition ${
+                mode === m ? "bg-white text-indigo-700 font-medium shadow"
+                           : "text-slate-500 hover:text-slate-700"}`}>
+              {m === "login" ? "Sign in" : "Sign up"}
+            </button>
+          ))}
+        </div>
+
         <form onSubmit={submit} className="space-y-3">
           <label className="block">
             <span className="text-sm font-medium text-slate-700">Email</span>
             <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="you@company.com"
-              autoFocus
+              type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@company.com" autoFocus required
               className="mt-1 w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              required
             />
           </label>
-          <button
-            type="submit"
-            disabled={busy}
-            className="w-full bg-indigo-600 text-white py-2.5 rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 shadow"
-          >
-            {busy ? "Signing you in…" : "Sign in / Sign up →"}
+          <label className="block">
+            <span className="text-sm font-medium text-slate-700">Password</span>
+            <input
+              type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+              placeholder="at least 8 characters" required
+              className="mt-1 w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+            <span className="text-[11px] text-slate-400 mt-0.5 inline-block">
+              Hashed with bcrypt server-side. Never stored in plaintext.
+            </span>
+          </label>
+          <button type="submit" disabled={busy}
+            className="w-full bg-indigo-600 text-white py-2.5 rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 shadow">
+            {busy ? (mode === "register" ? "Creating account…" : "Signing in…")
+                  : (mode === "register" ? "Sign up →" : "Sign in →")}
           </button>
         </form>
 
         <div className="mt-6 text-xs text-slate-500 text-center leading-relaxed">
-          No password needed for the hackathon demo. Your email maps to a
-          private tenant; every reconciliation, calibration, and learned
-          fact is scoped to your account.
-        </div>
-
-        <div className="mt-4 pt-4 border-t border-slate-200">
-          <div className="text-[11px] text-slate-400 text-center">
-            Already a user with a different email?{" "}
-            <button onClick={signOut}
-              className="text-indigo-600 hover:underline">
-              Clear local state
-            </button>
-          </div>
+          Your email maps to a private tenant. Every reconciliation,
+          calibration, learned fact, and account note is scoped to your
+          login — bearer tokens are Ed25519-signed by the same key that
+          attests our audit packs.
         </div>
       </div>
     </div>

@@ -95,18 +95,30 @@ export function ToastProvider({ children, max = 4, ttlMs = 6000 }) {
 }
 
 /** Wrap fetch — surface non-2xx responses + network errors as toasts.
- *  Also auto-attaches the active tenant id so backend memory + config are
- *  scoped to the signed-in account. */
+ *  Auto-attaches the signed bearer token (preferred) and the tenant id
+ *  (legacy fallback) so backend scoping is authoritative on the token. */
 export async function apiFetch(input, init = {}) {
-  const tenant = (typeof localStorage !== "undefined")
-    ? localStorage.getItem("to_tenant_id") : null;
-  if (tenant) {
-    const h = new Headers(init.headers || {});
-    if (!h.has("x-tenant-id")) h.set("x-tenant-id", tenant);
-    init = { ...init, headers: h };
-  }
+  const ls = typeof localStorage !== "undefined" ? localStorage : null;
+  const tenant = ls ? ls.getItem("to_tenant_id") : null;
+  const token = ls ? ls.getItem("to_token") : null;
+  const h = new Headers(init.headers || {});
+  if (token && !h.has("Authorization")) h.set("Authorization", `Bearer ${token}`);
+  if (tenant && !h.has("x-tenant-id")) h.set("x-tenant-id", tenant);
+  init = { ...init, headers: h };
   try {
     const r = await fetch(input, init);
+    // 401 means the token expired or was rejected — clear local state
+    // and surface a clean redirect to the sign-in screen.
+    if (r.status === 401 && token) {
+      ls.removeItem("to_token");
+      ls.removeItem("to_tenant_id");
+      ls.removeItem("to_email");
+      ls.removeItem("to_onboarded");
+      window.dispatchEvent(new Event("to-account-changed"));
+      pushToast({ kind: "warn", title: "Session expired",
+                  message: "Please sign in again." });
+      return r;
+    }
     if (!r.ok) {
       let detail = "";
       try {
