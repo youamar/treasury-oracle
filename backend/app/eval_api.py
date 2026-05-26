@@ -25,6 +25,28 @@ def run_eval(body: EvalRunBody):
     )
 
 
+class GateBody(BaseModel):
+    label: str = ""
+    max_accuracy_drop: float = 0.02
+    min_absolute_accuracy: float = 0.0
+    include_live: bool = True
+
+
+@router.post("/gate")
+def gate(body: GateBody):
+    """Run eval and compare against best historical run for this tenant.
+    Fails if overall accuracy dropped > max_accuracy_drop, OR if any hard
+    fixture that previously passed now fails. Useful as a pre-commit hook
+    or CI check."""
+    from . import eval_gate as _gate
+    return _gate.run_gate(
+        label=body.label,
+        max_accuracy_drop=body.max_accuracy_drop,
+        min_absolute_accuracy=body.min_absolute_accuracy,
+        include_live=body.include_live,
+    )
+
+
 @router.get("/runs")
 def list_runs(limit: int = 20):
     return {"runs": db.list_eval_runs(limit=limit)}

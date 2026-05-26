@@ -54,6 +54,8 @@ export default function EvalPanel() {
   const [diff, setDiff] = useState(null);
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
+  const [gateBusy, setGateBusy] = useState(false);
+  const [gate, setGate] = useState(null);
 
   async function loadRuns() {
     try {
@@ -85,6 +87,33 @@ export default function EvalPanel() {
   }
 
   useEffect(() => { loadRuns(); }, []);
+
+  async function runGate() {
+    setGateBusy(true);
+    setGate(null);
+    try {
+      const r = await fetch(`${API}/gate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      setGate(j);
+      await loadRuns();
+      pushToast({
+        kind: j.passes ? "ok" : "warn",
+        title: j.passes ? "Gate PASSED ✓" : "Gate FAILED ✗",
+        message: j.passes
+          ? `Accuracy ${(j.current_accuracy*100).toFixed(1)}% — no regressions.`
+          : `${j.regressions.length} regression${j.regressions.length !== 1 ? "s" : ""} detected.`,
+      });
+    } catch (e) {
+      pushToast({ kind: "error", title: "Gate failed to run",
+                  message: String(e?.message || e) });
+    }
+    setGateBusy(false);
+  }
 
   async function runNow() {
     setBusy(true);
@@ -119,7 +148,7 @@ export default function EvalPanel() {
       title="Evaluation"
       subtitle="Run the agent against labeled fixtures. Every prompt edit, model swap, or skill toggle is measured against the same cases — diff vs previous tells you whether it helped."
       actions={
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           <input value={label} onChange={(e) => setLabel(e.target.value)}
                  placeholder="optional label"
                  className="border border-slate-300 rounded px-2 py-1 text-sm" />
@@ -127,9 +156,96 @@ export default function EvalPanel() {
                   className="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 text-sm disabled:opacity-50 shadow">
             {busy ? "Running…" : "▶ Run eval"}
           </button>
+          <button disabled={gateBusy} onClick={runGate}
+                  title="Run eval and compare to the best historical run; fails on accuracy drop or hard-case regression."
+                  className="px-4 py-2 rounded-lg border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-50 text-sm disabled:opacity-50">
+            {gateBusy ? "Gating…" : "🛡 Run regression gate"}
+          </button>
         </div>
       }
     >
+      {/* Regression gate verdict */}
+      {gate && (
+        <Card title={`🛡 Regression gate — ${gate.passes ? "PASS" : "FAIL"}`}
+              subtitle="Compares current run against the best historical run for this tenant."
+              className={gate.passes ? "border-2 border-emerald-300" : "border-2 border-red-300"}>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Current</div>
+              <div className="text-2xl font-bold text-slate-900 tabular-nums">
+                {gate.current_accuracy != null ? `${(gate.current_accuracy*100).toFixed(1)}%` : "—"}
+              </div>
+              <div className="text-xs text-slate-500">run #{gate.current_run_id}</div>
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Baseline</div>
+              <div className="text-2xl font-bold text-slate-700 tabular-nums">
+                {gate.baseline_accuracy != null ? `${(gate.baseline_accuracy*100).toFixed(1)}%` : "—"}
+              </div>
+              <div className="text-xs text-slate-500">
+                {gate.baseline_run_id != null ? `run #${gate.baseline_run_id}` : "no prior run"}
+              </div>
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Δ Accuracy</div>
+              <div className={`text-2xl font-bold tabular-nums ${
+                gate.accuracy_drop == null ? "text-slate-400" :
+                gate.accuracy_drop <= 0 ? "text-emerald-700" :
+                gate.accuracy_drop <= gate.max_accuracy_drop ? "text-amber-700" :
+                "text-red-700"
+              }`}>
+                {gate.accuracy_drop == null ? "—" :
+                 `${gate.accuracy_drop > 0 ? "−" : "+"}${Math.abs(gate.accuracy_drop * 100).toFixed(2)}pp`}
+              </div>
+              <div className="text-xs text-slate-500">
+                ceiling {(gate.max_accuracy_drop*100).toFixed(0)}pp
+              </div>
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wider text-slate-500">Hard regressions</div>
+              <div className={`text-2xl font-bold tabular-nums ${
+                gate.hard_case_regressions?.length ? "text-red-700" : "text-emerald-700"
+              }`}>
+                {gate.hard_case_regressions?.length || 0}
+              </div>
+              <div className="text-xs text-slate-500">{gate.n_cases} cases total</div>
+            </div>
+          </div>
+          {gate.regressions.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded p-3">
+              <div className="font-semibold text-red-900 mb-1">Why it failed:</div>
+              <ul className="text-sm space-y-1">
+                {gate.regressions.map((r, i) => (
+                  <li key={i} className="text-red-800">• {r}</li>
+                ))}
+              </ul>
+              {gate.hard_case_regressions?.length > 0 && (
+                <div className="mt-2 text-xs">
+                  <b>Hard cases that flipped:</b>
+                  <ul className="font-mono mt-1 space-y-0.5">
+                    {gate.hard_case_regressions.map((r, i) => (
+                      <li key={i}>
+                        {r.id}: <span className="text-emerald-700">{r.predicted_baseline}</span>
+                        {" → "}
+                        <span className="text-red-700">{r.predicted_now}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+          {gate.passes && (
+            <div className="bg-emerald-50 border border-emerald-200 rounded p-3 text-sm text-emerald-900">
+              ✓ No regressions detected. Safe to ship this config.
+            </div>
+          )}
+          <div className="mt-2 text-[11px] text-slate-500">
+            Also runnable as <code className="bg-slate-100 px-1 rounded">python -m app.eval_gate</code> (exits 1 on regression — pre-commit ready).
+          </div>
+        </Card>
+      )}
+
       {/* Run list */}
       <Card title="Past runs"
             subtitle="Eval runs default to temperature=0 so reruns are reproducible.">
