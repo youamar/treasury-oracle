@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 @router.get("/summary")
 def memory_summary():
+    notes = db.get_tenant_notes()
     return {
         "tenant": db.current_tenant(),
         "aliases": db.all_aliases(),
@@ -24,7 +25,30 @@ def memory_summary():
         "session_count": len(db.list_sessions(limit=1000)),
         "upload_count": len(db.list_uploads(limit=1000)),
         "error_count": len(db.list_errors(limit=1000)),
+        "notes_chars": len(notes.get("content") or ""),
+        "notes_updated_at": notes.get("updated_at"),
     }
+
+
+# ---------- per-account knowledge notes ----------
+
+class NotesBody(BaseModel):
+    content: str
+
+
+@router.get("/notes")
+def get_notes():
+    return db.get_tenant_notes()
+
+
+@router.put("/notes")
+def put_notes(body: NotesBody):
+    return db.save_tenant_notes(body.content, saved_by="user")
+
+
+@router.get("/notes/history")
+def notes_history(limit: int = 20):
+    return {"history": db.list_tenant_notes_history(limit=limit)}
 
 
 # ---------- aliases ----------

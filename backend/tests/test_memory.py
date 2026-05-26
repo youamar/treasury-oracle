@@ -132,3 +132,93 @@ def test_recall_skill_handler_round_trip():
     out = SKILL_REGISTRY["recall_facts"].handler(ctx, subject="RoundTrip")
     assert out["count"] >= 1
     assert any(f["value"] == "v" for f in out["facts"])
+
+
+def test_tenant_notes_round_trip():
+    """Notes upsert per tenant; previous content goes to history on change."""
+    from app import db
+    with db.tenant_scope("notes-test"):
+        # First read on fresh tenant returns empty.
+        n0 = db.get_tenant_notes()
+        assert n0["content"] == ""
+        assert n0["updated_at"] is None
+
+        db.save_tenant_notes("# Acme Corp\nPays from holding co.")
+        n1 = db.get_tenant_notes()
+        assert "Acme" in n1["content"]
+        assert n1["updated_at"] is not None
+
+        # History is empty on first save (no prior content to archive).
+        assert db.list_tenant_notes_history() == []
+
+        # Change → previous version goes to history.
+        db.save_tenant_notes("# Acme Corp\nUPDATED.")
+        n2 = db.get_tenant_notes()
+        assert "UPDATED" in n2["content"]
+        hist = db.list_tenant_notes_history()
+        assert len(hist) == 1
+        assert "Pays from holding co" in hist[0]["content"]
+
+
+def test_tenant_notes_scoped_per_tenant():
+    """Notes never leak between tenants."""
+    from app import db
+    with db.tenant_scope("acme"):
+        db.save_tenant_notes("acme secrets")
+    with db.tenant_scope("globex"):
+        db.save_tenant_notes("globex secrets")
+    with db.tenant_scope("acme"):
+        assert "acme" in db.get_tenant_notes()["content"]
+    with db.tenant_scope("globex"):
+        assert "globex" in db.get_tenant_notes()["content"]
+
+
+def test_notes_endpoints():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+
+    # GET on empty tenant returns empty content
+    r = client.get("/api/memory/notes", headers={"x-tenant-id": "ep-test"})
+    assert r.status_code == 200
+    assert r.json()["content"] == ""
+
+    # PUT saves
+    r = client.put("/api/memory/notes",
+                   json={"content": "## Maybank quirks\nThey post next-day."},
+                   headers={"x-tenant-id": "ep-test"})
+    assert r.status_code == 200
+    assert "Maybank" in r.json()["content"]
+
+    # Summary reflects the write
+    s = client.get("/api/memory/summary",
+                   headers={"x-tenant-id": "ep-test"}).json()
+    assert s["notes_chars"] > 0
+
+
+def test_agent_reads_notes_into_system_prompt(sample_proof, sample_txn, monkeypatch):
+    """Notes content shows up in the agent's system message."""
+    from app import agent as agent_mod, db
+    db.save_tenant_notes(
+        "TENANT_NOTES_MARKER_XYZ123\nAcme always pays from Singapore.")
+
+    captured = []
+    class _Capture:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(messages=None, **kw):
+                    captured.extend(messages or [])
+                    import json
+                    class _M:
+                        content = json.dumps({"decision": "no_match",
+                                              "confidence": 0, "reasoning": "x"})
+                        tool_calls = None
+                    class _R: choices = [type("C", (), {"message": _M})]
+                    return _R()
+    monkeypatch.setattr(agent_mod, "get_client", lambda use_fallback=False: _Capture())
+
+    agent_mod.reconcile_agent([sample_proof], [sample_txn], "Maybank")
+    sys_msgs = [m for m in captured if m.get("role") == "system"]
+    assert any("TENANT_NOTES_MARKER_XYZ123" in (m.get("content") or "")
+               for m in sys_msgs), "tenant notes not threaded into agent system prompt"

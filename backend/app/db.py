@@ -305,6 +305,25 @@ CREATE TABLE IF NOT EXISTS calibrators (
     UNIQUE (tenant_id, scope)
 );
 
+CREATE TABLE IF NOT EXISTS tenant_notes (
+    -- A free-form markdown 'knowledge file' per tenant. Read by the agent
+    -- on every reconciliation, editable from the Memory page. Think of it
+    -- as MEMORY.md scoped to one customer.
+    tenant_id TEXT PRIMARY KEY,
+    content TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tenant_notes_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    saved_by TEXT             -- 'user' | 'agent' | <session_id>
+);
+CREATE INDEX IF NOT EXISTS idx_notes_history_tenant
+    ON tenant_notes_history(tenant_id, saved_at);
+
 CREATE TABLE IF NOT EXISTS column_mappings (
     tenant_id TEXT NOT NULL DEFAULT 'default',
     bank TEXT NOT NULL,
@@ -1189,6 +1208,59 @@ def list_live_fixtures(limit: int = 200) -> list[dict]:
         d["txn_candidates"] = json.loads(d["txn_candidates_json"])
         out.append(d)
     return out
+
+
+# ---------- tenant notes (per-account knowledge file) ----------
+
+def get_tenant_notes() -> dict:
+    """Return the current notes for this tenant. Always returns a dict;
+    `content` is empty string for first-time tenants."""
+    with conn() as c:
+        r = c.execute(
+            "SELECT content, updated_at FROM tenant_notes WHERE tenant_id = ?",
+            (_t(),),
+        ).fetchone()
+    if r is None:
+        return {"content": "", "updated_at": None}
+    return {"content": r["content"], "updated_at": r["updated_at"]}
+
+
+def save_tenant_notes(content: str, saved_by: str = "user") -> dict:
+    """Upsert the notes. Also pushes the previous version into a history
+    table so accidental overwrites can be recovered."""
+    t = _t()
+    now = _now()
+    with conn() as c:
+        c.execute("BEGIN")
+        prev = c.execute(
+            "SELECT content FROM tenant_notes WHERE tenant_id = ?", (t,),
+        ).fetchone()
+        # Only record history if content actually changed.
+        if prev is not None and prev["content"] != content:
+            c.execute(
+                "INSERT INTO tenant_notes_history(tenant_id, content, saved_at, saved_by) "
+                "VALUES (?, ?, ?, ?)",
+                (t, prev["content"], now, saved_by),
+            )
+        c.execute(
+            "INSERT INTO tenant_notes(tenant_id, content, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(tenant_id) DO UPDATE SET "
+            "content = excluded.content, updated_at = excluded.updated_at",
+            (t, content, now),
+        )
+        c.execute("COMMIT")
+    return {"content": content, "updated_at": now}
+
+
+def list_tenant_notes_history(limit: int = 20) -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, content, saved_at, saved_by FROM tenant_notes_history "
+            "WHERE tenant_id = ? ORDER BY id DESC LIMIT ?",
+            (_t(), limit),
+        )
+        return [dict(r) for r in rows]
 
 
 # ---------- column mappings (F5: drift detection) ----------

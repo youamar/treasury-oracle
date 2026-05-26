@@ -12,7 +12,10 @@ export default function MemoryPanel() {
   const [uploads, setUploads] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [errors, setErrors] = useState([]);
-  const [tab, setTab] = useState("learned");
+  const [tab, setTab] = useState("notes");
+  const [notes, setNotes] = useState({ content: "", updated_at: null });
+  const [notesDraft, setNotesDraft] = useState("");
+  const [notesDirty, setNotesDirty] = useState(false);
 
   // forms
   const [aliasCanonical, setAliasCanonical] = useState("");
@@ -23,13 +26,14 @@ export default function MemoryPanel() {
 
   async function load() {
     try {
-      const [s, a, f, u, ss, er] = await Promise.all([
+      const [s, a, f, u, ss, er, nr] = await Promise.all([
         fetch(`${API}/summary`).then((r) => r.json()),
         fetch(`${API}/aliases`).then((r) => r.json()),
         fetch(`${API}/facts`).then((r) => r.json()),
         fetch(`${API}/uploads`).then((r) => r.json()),
         fetch(`${API}/sessions?limit=20`).then((r) => r.json()),
         fetch(`${API}/errors?limit=30`).then((r) => r.json()),
+        fetch(`${API}/notes`).then((r) => r.json()),
       ]);
       setSummary(s);
       setAliases(a.aliases || {});
@@ -37,8 +41,30 @@ export default function MemoryPanel() {
       setUploads(u.uploads || []);
       setSessions(ss.sessions || []);
       setErrors(er.errors || []);
+      setNotes(nr || { content: "", updated_at: null });
+      setNotesDraft(nr?.content || "");
+      setNotesDirty(false);
     } catch (e) {
       pushToast({ kind: "error", title: "Failed to load memory",
+                  message: String(e?.message || e) });
+    }
+  }
+
+  async function saveNotes() {
+    try {
+      const r = await fetch(`${API}/notes`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: notesDraft }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const j = await r.json();
+      setNotes(j);
+      setNotesDirty(false);
+      pushToast({ kind: "ok", title: "Notes saved",
+                  message: "Agent will read these on the next reconciliation." });
+    } catch (e) {
+      pushToast({ kind: "error", title: "Save failed",
                   message: String(e?.message || e) });
     }
   }
@@ -93,6 +119,9 @@ export default function MemoryPanel() {
   }
 
   const tabs = [
+    { id: "notes",    label: "📝 Notes",
+      count: notes.content ? notes.content.length : 0,
+      countSuffix: " ch" },
     { id: "learned", label: "🧠 Learned",
       count: Object.keys(aliases).length + facts.length },
     { id: "sessions", label: "📜 Sessions", count: sessions.length },
@@ -100,6 +129,19 @@ export default function MemoryPanel() {
     { id: "errors",   label: "⚠ Errors",   count: errors.length,
       danger: errors.length > 0 },
   ];
+
+  const NOTES_PLACEHOLDER = `# Knowledge for your treasury agent
+
+The agent reads this file before every reconciliation. Put things here that:
+
+- Aren't in the bank statement but matter (e.g. "Acme Corp pays from their
+  Singapore holding company, not the entity on the invoice")
+- Change month-to-month (e.g. "Maybank's inbound fee jumped to 0.6% in April")
+- Help disambiguate (e.g. "INV-2026-008 is the boss's brother-in-law — only
+  he pays from a personal account")
+
+Plain markdown. No special syntax required. Truncated at 4 KB inside the
+agent prompt, so keep it concise — link to longer docs if needed.`;
 
   return (
     <Page
@@ -130,20 +172,65 @@ export default function MemoryPanel() {
       )}
 
       {/* Tab nav */}
-      <div className="flex gap-1 border-b border-slate-200 -mb-2">
+      <div className="flex gap-1 border-b border-slate-200 -mb-2 overflow-x-auto">
         {tabs.map((t) => (
           <button key={t.id} onClick={() => setTab(t.id)}
-            className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition ${
+            className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition whitespace-nowrap ${
               tab === t.id
                 ? "border-indigo-600 text-indigo-700"
                 : t.danger
                 ? "border-transparent text-red-600 hover:text-red-700"
                 : "border-transparent text-slate-500 hover:text-slate-700"
             }`}>
-            {t.label} {t.count > 0 && <span className="text-xs opacity-70">({t.count})</span>}
+            {t.label} {t.count > 0 && (
+              <span className="text-xs opacity-70">
+                ({t.count}{t.countSuffix || ""})
+              </span>
+            )}
           </button>
         ))}
       </div>
+
+      {tab === "notes" && (
+        <Card
+          title="📝 Account knowledge"
+          subtitle="A markdown 'MEMORY.md' for your treasury agent. Auto-injected into the agent's system prompt on every run."
+          actions={
+            <>
+              {notesDirty && <Badge color="amber">unsaved</Badge>}
+              <button onClick={saveNotes}
+                      disabled={!notesDirty}
+                      className="px-4 py-1.5 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-40">
+                Save
+              </button>
+            </>
+          }
+        >
+          <textarea
+            value={notesDraft}
+            onChange={(e) => { setNotesDraft(e.target.value); setNotesDirty(true); }}
+            placeholder={NOTES_PLACEHOLDER}
+            rows={18}
+            className="w-full border border-slate-300 rounded p-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            spellCheck={false}
+          />
+          <div className="mt-2 flex justify-between text-[11px] text-slate-500">
+            <span>
+              {notesDraft.length.toLocaleString()} chars
+              {notesDraft.length > 4000 && (
+                <span className="text-amber-700 ml-2">
+                  ⚠ over 4 KB — agent will see the first 4000 characters only
+                </span>
+              )}
+            </span>
+            <span>
+              {notes.updated_at
+                ? `last saved ${notes.updated_at}`
+                : "never saved"}
+            </span>
+          </div>
+        </Card>
+      )}
 
       {tab === "learned" && (
         <>

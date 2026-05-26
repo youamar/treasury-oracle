@@ -322,12 +322,28 @@ Be decisive. Do not call the same tool twice with identical arguments."""
 
 
 def _compose_system_prompt(tool_skills: list, platform_cfg: dict) -> str:
-    """Merge base prompt with per-skill usage guidance. The base prompt is
-    editable per-tenant via platform_config['agent_knobs']['base_prompt']
-    — falls back to the built-in _BASE_PROMPT when not set."""
+    """Merge base prompt with per-skill usage guidance and the tenant's
+    own knowledge notes (per-account MEMORY.md). Base prompt is editable
+    via platform_config['agent_knobs']['base_prompt']."""
     knobs = (platform_cfg or {}).get("agent_knobs") or {}
     base = knobs.get("base_prompt") or _BASE_PROMPT
-    sections = [base, "", "Tool usage guidance:"]
+    sections = [base]
+
+    # Per-account knowledge file. Surfaces things like "Acme Corp pays from
+    # their Singapore holding company", "Maybank charges 0.6% not 0.5% for
+    # USD inbound this month", etc. Capped at 4KB so a long doc can't
+    # blow out the context window.
+    notes = (db.get_tenant_notes().get("content") or "").strip()
+    if notes:
+        clipped = notes[:4000]
+        sections.extend([
+            "",
+            "ACCOUNT KNOWLEDGE (operator-maintained — treat as ground truth):",
+            clipped,
+            ("…[truncated]" if len(notes) > 4000 else ""),
+        ])
+
+    sections.extend(["", "Tool usage guidance:"])
     for s in tool_skills:
         sc = resolve_skill_config(s, platform_cfg)
         sections.append(f"- {s.id}: {sc.get('system_prompt', '').strip()}")
