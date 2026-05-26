@@ -164,6 +164,9 @@ class ReconcileRequest(BaseModel):
     transactions: list[dict]
     bank: str = "default"
     mode: str = "agent"  # "agent" | "classical"
+    # Client-supplied so the UI can poll /api/session/{id} for live trace
+    # rendering while the agent is still mid-flight.
+    session_id: str | None = None
 
 
 def _request_hash(body: "ReconcileRequest") -> str:
@@ -202,12 +205,13 @@ async def reconcile_endpoint(
 
     if body.mode == "classical":
         result = reconcile_classical(body.proofs, body.transactions, body.bank)
-        recon_id = str(uuid.uuid4())[:8]
+        recon_id = body.session_id or str(uuid.uuid4())[:8]
         result["mode"] = "classical"
         result["recon_id"] = recon_id
         db.save_session(recon_id, body.bank, result)
     else:
-        result = reconcile_agent(body.proofs, body.transactions, body.bank)
+        result = reconcile_agent(body.proofs, body.transactions, body.bank,
+                                 session_id=body.session_id)
         recon_id = result.get("recon_id")
 
     if idempotency_key and recon_id:
@@ -221,6 +225,14 @@ def get_session(recon_id: str):
     if not s:
         raise HTTPException(404, "session not found")
     return s
+
+
+@app.get("/api/session/{recon_id}/trace")
+def get_session_trace(recon_id: str):
+    """Live trace events for an in-flight or completed session. Returns 200
+    with an empty list even if the session hasn't been finalized yet, so the
+    UI can poll while the agent is still running."""
+    return {"trace": db.get_trace(recon_id)}
 
 
 @app.get("/api/report/{recon_id}")

@@ -13,7 +13,7 @@ import SalesValidator from "./SalesValidator.jsx";
 import Settings from "./Settings.jsx";
 import MemoryPanel from "./MemoryPanel.jsx";
 import EvalPanel from "./EvalPanel.jsx";
-import { apiFetch as fetch } from "./Toast.jsx";
+import { apiFetch as fetch, pushToast } from "./Toast.jsx";
 
 const API = "/api";
 
@@ -46,7 +46,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [bank, setBank] = useState("Maybank");
   const [busy, setBusy] = useState("");
-  const [err, setErr] = useState("");
+  const [liveTrace, setLiveTrace] = useState([]);  // streaming agent events while busy
   const [dunningTarget, setDunningTarget] = useState(null);
   const [view, setView] = useState("recon"); // "recon" | "settings" | "memory"
 
@@ -57,21 +57,24 @@ export default function App() {
   async function runOCR() {
     if (!proofFiles.length) return;
     setBusy("Vision LLM reading payment proofs...");
-    setErr("");
     try {
       const fd = new FormData();
       proofFiles.forEach((f) => fd.append("files", f));
       const r = await fetch(`${API}/extract-proofs`, { method: "POST", body: fd });
       const j = await r.json();
       appendProofs(j.proofs || []);
-    } catch (e) { setErr(String(e)); }
+      const n = (j.proofs || []).length;
+      if (n) pushToast({ kind: "ok", title: "OCR complete",
+                         message: `Extracted ${n} proof${n !== 1 ? "s" : ""}.` });
+    } catch (e) {
+      pushToast({ kind: "error", title: "OCR failed", message: String(e) });
+    }
     setBusy("");
   }
 
   async function runParse() {
     if (!stmtFile) return;
     setBusy("Parsing bank statement...");
-    setErr("");
     try {
       const fd = new FormData();
       fd.append("file", stmtFile);
@@ -89,20 +92,51 @@ export default function App() {
         outbound_count: j.outbound_count || 0,
         column_drift: j.column_drift || null,
       });
-    } catch (e) { setErr(String(e)); }
+      if (j.column_drift?.severity === "fields_moved") {
+        pushToast({
+          kind: "warn", title: "Critical column drift",
+          message: `Bank statement headers changed since last upload for ${bank}.`,
+        });
+      } else {
+        pushToast({
+          kind: "ok", title: "Statement parsed",
+          message: `${(j.transactions || []).length} inbound transactions ready.`,
+        });
+      }
+    } catch (e) {
+      pushToast({ kind: "error", title: "Parse failed", message: String(e) });
+    }
     setBusy("");
   }
 
   async function runReconcile() {
     if (!proofs.length || !txns.length) return;
-    setBusy("Agent reconciling: FX lookups, fee calc, fuzzy matching, SWIFT trace...");
-    setErr("");
+    setBusy("Agent starting...");
+    setLiveTrace([]);
     // Stable idempotency key for THIS set of inputs — a tab refresh that
     // re-submits the same proofs+txns will hit the cached recon_id instead
     // of spending tokens again.
     const idempKey = "recon-" + await sha256Short(
       JSON.stringify({ bank, proofs, txns })
     );
+    // Client-generated session id so we can poll trace while the agent runs.
+    const liveSid = "live-" + Math.random().toString(36).slice(2, 10);
+    let polling = true;
+    (async () => {
+      while (polling) {
+        await new Promise(r => setTimeout(r, 800));
+        if (!polling) break;
+        try {
+          const tr = await fetch(`${API}/session/${liveSid}/trace`).then(r => r.json());
+          setLiveTrace(tr.trace || []);
+          if (tr.trace?.length) {
+            const last = tr.trace[tr.trace.length - 1];
+            setBusy(`Agent step ${last.step} — ${last.type}${
+              last.payload?.name ? `: ${last.payload.name}` : ""}`);
+          }
+        } catch {}
+      }
+    })();
     try {
       const r = await fetch(`${API}/reconcile`, {
         method: "POST",
@@ -110,10 +144,24 @@ export default function App() {
           "Content-Type": "application/json",
           "Idempotency-Key": idempKey,
         },
-        body: JSON.stringify({ proofs, transactions: txns, bank }),
+        body: JSON.stringify({ proofs, transactions: txns, bank, session_id: liveSid }),
       });
-      setResult(await r.json());
-    } catch (e) { setErr(String(e)); }
+      const j = await r.json();
+      setResult(j);
+      if (j.idempotent_replay) {
+        pushToast({ kind: "ok", title: "Restored from cache",
+                    message: "Identical inputs — replayed without re-running the agent." });
+      } else {
+        const s = j.summary || {};
+        pushToast({
+          kind: "ok", title: "Reconciliation complete",
+          message: `${s.matched || 0} matched · ${s.soft_matches || 0} soft · ${s.unmatched_proofs || 0} discrepancies`,
+        });
+      }
+    } catch (e) {
+      pushToast({ kind: "error", title: "Reconcile failed", message: String(e) });
+    }
+    polling = false;
     setBusy("");
   }
 
@@ -159,8 +207,15 @@ export default function App() {
         body: JSON.stringify({ bank }),
       }).then(r => r.json());
       appendProofs(r.proofs || []);
-      alert(`Month-end close: ${r.ingested_proofs} proof(s) ingested. ${r.next_step}`);
-    } catch (e) { setErr(String(e)); }
+      pushToast({
+        kind: "ok",
+        title: "🌙 Month-end close",
+        message: `${r.ingested_proofs} proof${r.ingested_proofs !== 1 ? "s" : ""} ingested.`,
+        detail: r.next_step,
+      });
+    } catch (e) {
+      pushToast({ kind: "error", title: "Month-end close failed", message: String(e) });
+    }
     setBusy("");
   }
 
@@ -200,8 +255,6 @@ export default function App() {
       {(view !== "recon") ? null : (
 
       <main className="max-w-6xl mx-auto p-6 space-y-6">
-        {err && <div className="bg-red-100 text-red-800 p-3 rounded">{err}</div>}
-
         <section className="grid md:grid-cols-2 gap-4">
           <div className="bg-white p-5 rounded-xl shadow">
             <h2 className="font-semibold mb-3">1. Payment Proofs</h2>
@@ -360,7 +413,43 @@ export default function App() {
               </button>
             </div>
           </div>
-          {busy && <div className="mt-3 text-sm text-blue-700 animate-pulse">{busy}</div>}
+          {busy && (
+            <div className="mt-3">
+              <div className="text-sm text-blue-700 flex items-center gap-2">
+                <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                {busy}
+              </div>
+              {liveTrace.length > 0 && (
+                <div className="mt-2 bg-slate-900 text-slate-100 rounded p-3 max-h-48 overflow-auto font-mono text-[11px] leading-relaxed">
+                  {liveTrace.slice(-30).map((t, i) => {
+                    const color = t.type === "decision" ? "text-green-300"
+                              : t.type === "tool_call" ? "text-cyan-300"
+                              : t.type === "tool_result" ? "text-slate-400"
+                              : t.type === "error" ? "text-red-300"
+                              : t.type === "verifier_downgrade" ? "text-amber-300"
+                              : t.type === "verifier_confirm" ? "text-emerald-300"
+                              : "text-slate-300";
+                    const label = t.type === "tool_call"
+                      ? `→ ${t.payload?.name}(${JSON.stringify(t.payload?.arguments || {}).slice(0, 60)})`
+                      : t.type === "tool_result"
+                      ? `← ${t.payload?.name}: ${JSON.stringify(t.payload?.result || {}).slice(0, 80)}`
+                      : t.type === "decision"
+                      ? `★ ${t.payload?.decision} (conf ${Math.round((t.payload?.confidence || 0)*100)}%)`
+                      : t.type === "verifier_downgrade"
+                      ? `⚠ verifier: ${(t.payload?.concerns || []).join("; ")}`
+                      : t.type === "verifier_confirm"
+                      ? `✓ verifier confirmed`
+                      : t.type;
+                    return (
+                      <div key={`${t.step}-${i}`} className={color}>
+                        <span className="text-slate-500">[{t.proof_source || "—"} step {t.step}]</span> {label}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         {result && (

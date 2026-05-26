@@ -372,14 +372,31 @@ def _migrate_tenant_columns(c):
 
 
 def init_db(path: Path | None = None):
-    """Idempotent schema creation + migration. Safe to call on every startup."""
+    """Idempotent schema creation + migration. Safe to call on every startup.
+
+    Order matters: existing DBs from earlier schema versions may have tables
+    without tenant_id. SCHEMA's CREATE INDEX ON ...(tenant_id) statements
+    crash if we run them before adding the column. So:
+      1. Ensure the tenants registry exists (needed by the FK target).
+      2. Migrate tenant_id onto any pre-existing tables that lack it.
+      3. Run the full SCHEMA (CREATE TABLE / INDEX IF NOT EXISTS).
+    """
     global _initialized
     with _init_lock:
         p = path or DB_PATH
         with sqlite3.connect(p) as c:
             c.executescript("PRAGMA journal_mode=WAL;")
-            c.executescript(SCHEMA)
+            # Bootstrap the tenants table by itself — _migrate references nothing
+            # else, but downstream INSERT INTO tenants needs it to exist.
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+            """)
             _migrate_tenant_columns(c)
+            c.executescript(SCHEMA)
             # Seed default tenant
             c.execute(
                 "INSERT OR IGNORE INTO tenants(id, name, created_at) VALUES (?, ?, ?)",
