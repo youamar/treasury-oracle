@@ -3,7 +3,10 @@ import os
 import uuid
 from pathlib import Path
 import hashlib
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query
+import time
+from contextlib import asynccontextmanager
+from collections import deque
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -29,22 +32,69 @@ from .memory_api import router as memory_router
 from .eval_api import router as eval_router
 from . import uploads as _uploads
 
-app = FastAPI(title="Global Treasury Agent", version="0.3.0")
-
-
-@app.on_event("startup")
-def _startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     db.init_db()
+    yield
+    # Shutdown
+    db.reset_pool()
+
+
+app = FastAPI(title="Global Treasury Agent", version="0.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
 
+# ---------- per-tenant rate limiting (R-5) ----------
+# Sliding-window in-memory limits per (tenant, endpoint). Defaults are
+# generous for the hackathon demo but block a runaway client from draining
+# Chutes quota. Returns 429 with Retry-After when exceeded.
+
+_RATE_LIMITS = {
+    # endpoint suffix → (max_requests, window_seconds)
+    "POST /api/reconcile":           (30, 60),
+    "POST /api/eval/run":            (10, 60),
+    "POST /api/eval/gate":           (5,  60),
+    "POST /api/platform/wizard":     (10, 60),
+    "POST /api/extract-proofs":      (60, 60),
+}
+_rate_windows: dict[tuple[str, str], deque] = {}
+
+
 @app.middleware("http")
-async def tenant_scope_mw(request, call_next):
+async def request_scope_mw(request: Request, call_next):
+    # Tenant context for this request.
     tenant = request.headers.get("x-tenant-id") or "default"
     token = db._current_tenant.set(tenant)
+
+    # Rate limit check (only on configured endpoints).
+    key_endpoint = f"{request.method} {request.url.path}"
+    limit_cfg = _RATE_LIMITS.get(key_endpoint)
+    if limit_cfg is not None:
+        max_req, window = limit_cfg
+        window_key = (tenant, key_endpoint)
+        now = time.monotonic()
+        q = _rate_windows.setdefault(window_key, deque())
+        # Drop entries outside the window.
+        while q and (now - q[0]) > window:
+            q.popleft()
+        if len(q) >= max_req:
+            db._current_tenant.reset(token)
+            from fastapi.responses import JSONResponse
+            retry_after = max(1, int(window - (now - q[0])))
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": f"rate limit exceeded: {max_req} requests per {window}s",
+                    "retry_after_seconds": retry_after,
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
+        q.append(now)
+
     try:
         return await call_next(request)
     finally:

@@ -182,3 +182,41 @@ def test_reconcile_no_key_runs_every_time():
     r1 = client.post("/api/reconcile", json=body).json()
     r2 = client.post("/api/reconcile", json=body).json()
     assert r1["recon_id"] != r2["recon_id"]
+
+
+def test_rate_limit_returns_429_when_exceeded():
+    """R-5: 11th eval/run call within 60s gets a 429 with Retry-After."""
+    from fastapi.testclient import TestClient
+    from app.main import app, _rate_windows
+    _rate_windows.clear()  # isolate test from any prior limit state
+
+    client = TestClient(app)
+    # 10 calls allowed per minute for /api/eval/run per the config.
+    for _ in range(10):
+        r = client.post("/api/eval/run", json={"label": "rl-test"})
+        assert r.status_code == 200
+    r = client.post("/api/eval/run", json={"label": "rl-bust"})
+    assert r.status_code == 429
+    assert "retry_after_seconds" in r.json()
+    assert r.headers.get("Retry-After")
+
+
+def test_rate_limit_scoped_per_tenant():
+    """Different tenants don't share the same bucket."""
+    from fastapi.testclient import TestClient
+    from app.main import app, _rate_windows
+    _rate_windows.clear()
+
+    client = TestClient(app)
+    for _ in range(10):
+        r = client.post("/api/eval/run", json={},
+                        headers={"x-tenant-id": "tenant-a"})
+        assert r.status_code == 200
+    # Tenant A is now rate-limited
+    r1 = client.post("/api/eval/run", json={},
+                     headers={"x-tenant-id": "tenant-a"})
+    assert r1.status_code == 429
+    # Tenant B still has a clean bucket
+    r2 = client.post("/api/eval/run", json={},
+                     headers={"x-tenant-id": "tenant-b"})
+    assert r2.status_code == 200
