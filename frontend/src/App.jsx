@@ -763,13 +763,22 @@ function Workspace() {
 
               <MagneticMatches matches={result.matches} />
               {result.matches.length > 0 && (
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {result.matches.map((m, i) => (
-                    <button key={i} onClick={() => downloadAuditPack(i)}
-                            className="text-xs px-3 py-1 bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-200 rounded hover:bg-slate-300 dark:hover:bg-slate-700">
-                      📚 Audit Pack: {m.proof.reference || `match ${i+1}`}
-                    </button>
-                  ))}
+                <div className="mt-3">
+                  <div className="flex flex-wrap gap-2">
+                    {result.matches.map((m, i) => (
+                      <button key={i} onClick={() => downloadAuditPack(i)}
+                              title="Cryptographically signed PDF with §5.5 provenance and §8 Ed25519 attestation"
+                              className="text-xs px-3 py-1 bg-slate-200 text-slate-700 rounded hover:bg-slate-300">
+                        🔒 Audit Pack: {m.proof.reference || `match ${i+1}`}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-[11px] text-slate-500 flex items-center gap-1.5">
+                    <span>🔐</span>
+                    <span>Each audit pack is Ed25519-signed and refuses to issue if source bytes were modified.</span>
+                    <a href="/api/audit-pack/public-key" target="_blank" rel="noreferrer"
+                       className="text-indigo-600 hover:underline">view public key</a>
+                  </div>
                 </div>
               )}
 

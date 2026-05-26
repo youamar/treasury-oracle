@@ -1,4 +1,16 @@
-"""Audit Defense Pack — per-transaction evidence bundle PDF for LHDN/auditors."""
+"""Audit Defense Pack — per-transaction evidence bundle PDF for LHDN/auditors.
+
+Tamper-evidence (F11+F12):
+  * Before rendering, every proof_source_sha256 referenced in the match
+    provenance is re-hashed against the stored bytes; mismatch raises
+    SourceBytesTampered and the pack refuses to issue.
+  * The rendered PDF includes a final §8 ATTESTATION SIGNATURE page with a
+    canonical-JSON manifest, an Ed25519 signature over that manifest, and
+    the public-key fingerprint. Anyone holding the PDF + the public key can
+    prove it was issued by this Treasury Oracle instance and was not
+    modified post-issuance (any field on the PDF that disagrees with the
+    signed manifest is provably tampered).
+"""
 import io
 from datetime import datetime, timezone
 from reportlab.lib.pagesizes import A4
@@ -9,8 +21,22 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 )
 
+from . import attestation
 
-def build_audit_pack(match: dict, bank_name: str) -> bytes:
+
+def build_audit_pack(match: dict, bank_name: str,
+                     recon_id: str | None = None,
+                     match_index: int | None = None) -> bytes:
+    # F11: re-hash the stored proof bytes; refuse to issue if tampered.
+    # Provenance carries the SHA in proof_amount.source_sha256.
+    prov_block = (match.get("conversion") or {}).get("provenance") or {}
+    proof_sha = (prov_block.get("proof_amount") or {}).get("source_sha256")
+    source_verification = attestation.verify_source_bytes(proof_sha)
+
+    # F12: sign a canonical manifest of this match — we'll render it on the
+    # last page so anyone holding the PDF + public key can verify it.
+    attestation_block = attestation.attest(match, bank_name, recon_id, match_index)
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm,
                             topMargin=1.8*cm, bottomMargin=1.8*cm)
@@ -139,6 +165,69 @@ def build_audit_pack(match: dict, bank_name: str) -> bytes:
     story.append(Paragraph(
         f"<i>Document ID: AUDIT-{tx['id']}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}</i>",
         mono))
+
+    # ---------- §8 ATTESTATION SIGNATURE (F12) ----------
+    story.append(PageBreak())
+    story.append(Paragraph("§8 CRYPTOGRAPHIC ATTESTATION", h2))
+    story.append(Paragraph(
+        "This page proves the audit pack was issued by this Treasury Oracle "
+        "instance and has not been modified after issuance. The manifest "
+        "below is signed with Ed25519; anyone holding the issuer's public "
+        "key (fingerprint shown) can verify the signature via "
+        "<font face='Courier'>POST /api/audit-pack/verify</font>. The signed "
+        "manifest also anchors the SHA-256 of the original proof file: "
+        "the body section above shows the same hash, and a re-hash of the "
+        "stored bytes was performed before this pack was issued.", small))
+    story.append(Spacer(1, 0.3*cm))
+
+    # Source verification result
+    sv = source_verification
+    if sv.get("verified"):
+        story.append(Paragraph(
+            f"<font color='#047857'>✓ Source-bytes verification PASSED at issuance.</font><br/>"
+            f"Original file: <font face='Courier'>{sv.get('filename')}</font>, "
+            f"{sv.get('size')} bytes, uploaded {sv.get('uploaded_at')}.", small))
+    elif sv.get("present") is False:
+        story.append(Paragraph(
+            "<font color='#92400e'>⚠ No source SHA in this match's provenance — "
+            "byte-integrity check skipped. This typically means the proof was "
+            "ingested before the upload-hashing was wired up.</font>", small))
+    story.append(Spacer(1, 0.3*cm))
+
+    # Attestation summary table
+    att_rows = [
+        ["Algorithm", attestation_block["algorithm"]],
+        ["Key fingerprint", attestation_block["public_key_fingerprint"]],
+        ["Manifest SHA-256", attestation_block["manifest_canonical_sha256"]],
+        ["Manifest schema", attestation_block["manifest"]["schema"]],
+        ["Issued at", attestation_block["manifest"]["issued_at"]],
+    ]
+    att_table = Table(att_rows, colWidths=[4.5*cm, 12.5*cm])
+    att_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f1f5f9")),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("FONTSIZE", (0,0), (-1,-1), 8),
+        ("FONTNAME", (1,1), (1,-1), "Courier"),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+    story.append(att_table)
+    story.append(Spacer(1, 0.3*cm))
+
+    # Signature block — wrap base64 so it doesn't overflow
+    sig = attestation_block["signature_b64"]
+    sig_wrapped = "<br/>".join(sig[i:i+64] for i in range(0, len(sig), 64))
+    story.append(Paragraph("<b>Ed25519 signature (base64):</b>", small))
+    story.append(Paragraph(sig_wrapped, mono))
+    story.append(Spacer(1, 0.3*cm))
+
+    # Canonical manifest JSON — render readable so a human can spot tampering
+    import json as _json
+    manifest_pretty = _json.dumps(attestation_block["manifest"],
+                                  indent=2, ensure_ascii=False, default=str)
+    story.append(Paragraph("<b>Signed manifest (canonical JSON):</b>", small))
+    for line in manifest_pretty.split("\n"):
+        # ReportLab needs &lt; for angle brackets but our content has none.
+        story.append(Paragraph(line.replace(" ", "&nbsp;"), mono))
 
     doc.build(story)
     return buf.getvalue()

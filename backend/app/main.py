@@ -456,18 +456,66 @@ def sales_validate(proof: dict):
 
 @app.get("/api/audit-pack/{recon_id}/{match_index}")
 def audit_pack(recon_id: str, match_index: int):
+    from . import attestation as _att
     s = db.load_session(recon_id)
     if not s:
         raise HTTPException(404, "session not found")
     matches = s["matches"]
     if match_index >= len(matches):
         raise HTTPException(404, "match index out of range")
-    pdf = build_audit_pack(matches[match_index], s["bank"])
+    try:
+        pdf = build_audit_pack(matches[match_index], s["bank"],
+                               recon_id=recon_id, match_index=match_index)
+    except _att.SourceBytesTampered as e:
+        # F11: refuse to issue when the underlying proof bytes changed.
+        raise HTTPException(422, f"source bytes tampered: {e}")
     inv = matches[match_index]["proof"].get("reference", f"m{match_index}")
     return Response(
         content=pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="audit_{inv}.pdf"'},
     )
+
+
+# ---------- audit pack attestation verification ----------
+
+@app.get("/api/audit-pack/public-key")
+def audit_pack_public_key():
+    """Public key anyone can use to verify Treasury Oracle audit packs."""
+    from . import attestation as _att
+    return {
+        "algorithm": "Ed25519",
+        "fingerprint": _att.public_key_fingerprint(),
+        "raw_b64": __import__("base64").b64encode(_att.public_key_bytes()).decode("ascii"),
+        "pem": _att.public_key_pem(),
+    }
+
+
+class VerifyAttestation(BaseModel):
+    manifest: dict
+    signature_b64: str
+
+
+@app.post("/api/audit-pack/verify")
+def audit_pack_verify(body: VerifyAttestation):
+    """Verify a manifest + signature. Returns whether the signature is valid
+    AND (if a source SHA is present) whether the source bytes still hash
+    to that value."""
+    from . import attestation as _att
+    sig_ok = _att.verify_signature(body.manifest, body.signature_b64)
+    sha = body.manifest.get("proof_source_sha256")
+    source_status = {"present": False, "verified": False}
+    if sha:
+        try:
+            source_status = _att.verify_source_bytes(sha)
+        except _att.SourceBytesTampered as e:
+            source_status = {"present": True, "verified": False, "reason": str(e)}
+    return {
+        "signature_valid": sig_ok,
+        "source_bytes": source_status,
+        "issuer_fingerprint": _att.public_key_fingerprint(),
+        "claimed_fingerprint": body.manifest.get("issuer_key_fingerprint"),
+        "all_valid": sig_ok and (source_status.get("verified") or not sha),
+    }
 
 
 # ---------- Dunning campaigns ----------

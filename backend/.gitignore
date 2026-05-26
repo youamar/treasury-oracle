@@ -1,5 +1,6 @@
 data/treasury.db
 data/treasury.db-*
+data/keys/
 data/treasury.db-shm
 data/treasury.db-wal
 data/inbox/*
