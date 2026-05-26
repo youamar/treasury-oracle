@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import MagneticMatches from "./MagneticMatches.jsx";
 import SwiftRoute from "./SwiftRoute.jsx";
 import DunningModal from "./DunningModal.jsx";
@@ -20,9 +20,9 @@ const API = "/api";
 
 function FileDrop({ label, multiple, onFiles, accept }) {
   return (
-    <label className="block border-2 border-dashed border-slate-300 rounded-xl p-5 text-center cursor-pointer hover:border-blue-500 hover:bg-blue-50 transition">
-      <div className="text-slate-600 font-medium text-sm">{label}</div>
-      <div className="text-[11px] text-slate-400 mt-1">Click to choose {multiple ? "files" : "a file"}</div>
+    <label className="block border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-5 text-center cursor-pointer hover:border-blue-500 hover:bg-blue-50 dark:hover:bg-blue-950/30 transition">
+      <div className="text-slate-600 dark:text-slate-300 font-medium text-sm">{label}</div>
+      <div className="text-[11px] text-slate-400 dark:text-slate-500 mt-1">Click to choose {multiple ? "files" : "a file"}</div>
       <input type="file" multiple={multiple} accept={accept} className="hidden"
              onChange={(e) => onFiles([...e.target.files])} />
     </label>
@@ -31,11 +31,68 @@ function FileDrop({ label, multiple, onFiles, accept }) {
 
 function Pill({ children, color = "slate" }) {
   const map = {
-    green: "bg-green-100 text-green-800", red: "bg-red-100 text-red-800",
-    blue: "bg-blue-100 text-blue-800", slate: "bg-slate-100 text-slate-700",
-    amber: "bg-amber-100 text-amber-800", purple: "bg-purple-100 text-purple-800",
+    green: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200",
+    red:   "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200",
+    blue:  "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200",
+    slate: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200",
+    amber: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200",
+    purple:"bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-200",
   };
   return <span className={`px-2 py-0.5 rounded text-xs font-medium ${map[color]}`}>{children}</span>;
+}
+
+/** Persistent dark-mode toggle. Reads/writes localStorage and toggles the
+ *  `dark` class on <html> so every Tailwind `dark:` variant kicks in. */
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === "undefined") return "light";
+    return localStorage.getItem("theme") ||
+      (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  });
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    localStorage.setItem("theme", theme);
+  }, [theme]);
+  return [theme, () => setTheme(t => t === "dark" ? "light" : "dark")];
+}
+
+/** 3-step progress stepper showing where the user is in the flow. */
+function Stepper({ proofsCount, txnsCount, hasResult }) {
+  const steps = [
+    { n: 1, label: "Payment Proofs", done: proofsCount > 0, count: proofsCount },
+    { n: 2, label: "Bank Statement", done: txnsCount > 0, count: txnsCount },
+    { n: 3, label: "Reconcile", done: hasResult, active: proofsCount > 0 && txnsCount > 0 && !hasResult },
+  ];
+  return (
+    <div className="flex items-center gap-2 sm:gap-4 mb-4">
+      {steps.map((s, i) => (
+        <React.Fragment key={s.n}>
+          <div className="flex items-center gap-2">
+            <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold border-2 ${
+              s.done ? "bg-emerald-500 border-emerald-500 text-white"
+              : s.active ? "bg-indigo-500 border-indigo-500 text-white animate-pulse"
+              : "bg-white dark:bg-slate-800 border-slate-300 dark:border-slate-600 text-slate-500 dark:text-slate-400"
+            }`}>
+              {s.done ? "✓" : s.n}
+            </div>
+            <div className="hidden sm:block">
+              <div className={`text-xs font-medium ${
+                s.done ? "text-emerald-700 dark:text-emerald-300"
+                : s.active ? "text-indigo-700 dark:text-indigo-300"
+                : "text-slate-500 dark:text-slate-400"
+              }`}>{s.label}</div>
+              {s.count !== undefined && (
+                <div className="text-[10px] text-slate-400 dark:text-slate-500">{s.count} loaded</div>
+              )}
+            </div>
+          </div>
+          {i < steps.length - 1 && (
+            <div className={`flex-1 h-0.5 ${s.done ? "bg-emerald-400" : "bg-slate-200 dark:bg-slate-700"}`} />
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
 }
 
 export default function App() {
@@ -48,6 +105,8 @@ export default function App() {
   const [bank, setBank] = useState("Maybank");
   const [busy, setBusy] = useState("");
   const [liveTrace, setLiveTrace] = useState([]);  // streaming agent events while busy
+  const [theme, toggleTheme] = useTheme();
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [dunningTarget, setDunningTarget] = useState(null);
   const [view, setView] = useState("recon"); // "recon" | "settings" | "memory"
 
@@ -241,32 +300,29 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <header className="bg-gradient-to-r from-blue-700 via-indigo-700 to-purple-700 text-white px-6 py-5 shadow">
-        <div className="flex items-start justify-between gap-4">
-          <div>
+      <header className="bg-gradient-to-r from-blue-700 via-indigo-700 to-purple-700 dark:from-blue-900 dark:via-indigo-900 dark:to-purple-900 text-white px-6 py-5 shadow">
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div className="min-w-0">
             <h1 className="text-2xl font-bold">🌍 Treasury Oracle <span className="text-blue-200 text-sm font-normal">— Skill Platform</span></h1>
             <p className="text-blue-100 text-sm">
               Composable treasury agent · Vision OCR · Fuzzy matching · SWIFT tracing · Multilingual dunning · Configurable per customer
             </p>
           </div>
-          <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
-            <button
-              onClick={() => setView("recon")}
-              className={`px-3 py-1 rounded ${view === "recon" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
-            >Reconcile</button>
-            <button
-              onClick={() => setView("memory")}
-              className={`px-3 py-1 rounded ${view === "memory" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
-            >Memory</button>
-            <button
-              onClick={() => setView("eval")}
-              className={`px-3 py-1 rounded ${view === "eval" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
-            >Eval</button>
-            <button
-              onClick={() => setView("settings")}
-              className={`px-3 py-1 rounded ${view === "settings" ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white"}`}
-            >Settings</button>
-          </nav>
+          <div className="flex items-center gap-3">
+            <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
+              {[["recon","Reconcile"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
+                <button key={k} onClick={() => setView(k)}
+                  className={`px-3 py-1 rounded transition ${view === k ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white hover:bg-white/10"}`}
+                >{l}</button>
+              ))}
+            </nav>
+            <button onClick={toggleTheme}
+                    title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+                    aria-label="Toggle dark mode"
+                    className="bg-white/10 hover:bg-white/20 rounded-lg w-8 h-8 flex items-center justify-center text-lg transition">
+              {theme === "dark" ? "☀️" : "🌙"}
+            </button>
+          </div>
         </div>
       </header>
       {view === "settings" && <Settings />}
@@ -275,17 +331,19 @@ export default function App() {
       {(view !== "recon") ? null : (
 
       <main className="max-w-6xl mx-auto p-6 space-y-6">
+        <Stepper proofsCount={proofs.length} txnsCount={txns.length} hasResult={!!result} />
+
         {/* First-run helper banner — only shown when workspace is empty */}
         {proofs.length === 0 && txns.length === 0 && (
-          <div className="bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 rounded-xl p-4 flex items-center justify-between gap-4 flex-wrap">
+          <div className="bg-gradient-to-r from-indigo-50 to-purple-50 dark:from-indigo-950/40 dark:to-purple-950/40 border border-indigo-200 dark:border-indigo-800 rounded-xl p-4 flex items-center justify-between gap-4 flex-wrap">
             <div>
-              <div className="font-semibold text-indigo-900">👋 First time here?</div>
-              <div className="text-sm text-indigo-700">
+              <div className="font-semibold text-indigo-900 dark:text-indigo-200">👋 First time here?</div>
+              <div className="text-sm text-indigo-700 dark:text-indigo-300">
                 Click <b>Try sample data</b> to skip the upload steps and see the agent in action with 8 pre-built payment proofs + a sample bank statement.
               </div>
             </div>
             <button onClick={loadSampleData}
-                    className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 font-medium whitespace-nowrap">
+                    className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 font-medium whitespace-nowrap shadow">
               🎬 Try sample data
             </button>
           </div>
@@ -293,20 +351,20 @@ export default function App() {
         {(proofs.length > 0 || txns.length > 0) && (
           <div className="flex items-center justify-end gap-2 text-sm">
             <button onClick={loadSampleData}
-                    className="text-indigo-700 hover:text-indigo-900 underline">
+                    className="text-indigo-700 dark:text-indigo-300 hover:text-indigo-900 dark:hover:text-indigo-100 underline">
               reload sample data
             </button>
-            <span className="text-slate-400">·</span>
+            <span className="text-slate-400 dark:text-slate-600">·</span>
             <button onClick={clearAll}
-                    className="text-slate-500 hover:text-red-600 underline">
+                    className="text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 underline">
               clear workspace
             </button>
           </div>
         )}
 
         <section className="grid md:grid-cols-2 gap-4">
-          <div className="bg-white p-5 rounded-xl shadow">
-            <h2 className="font-semibold mb-3">1. Payment Proofs</h2>
+          <div className="bg-white dark:bg-slate-900 dark:border dark:border-slate-800 p-5 rounded-xl shadow dark:shadow-slate-950/50">
+            <h2 className="font-semibold mb-3 text-slate-900 dark:text-slate-100">1. Payment Proofs</h2>
             <FileDrop
               label={proofFiles.length ? `${proofFiles.length} file(s) selected` : "Drop payment proof images / PDFs"}
               multiple accept="image/*,.pdf" onFiles={setProofFiles}
@@ -316,7 +374,7 @@ export default function App() {
               Extract with Vision LLM
             </button>
             {proofs.length > 0 && (
-              <ul className="mt-3 text-sm space-y-1 max-h-40 overflow-auto">
+              <ul className="mt-3 text-sm space-y-1 max-h-40 overflow-auto text-slate-700 dark:text-slate-300">
                 {proofs.map((p, i) => {
                   const q = p.ocr_quality || {};
                   const lowQ = q.gate === "low_quality";
@@ -343,8 +401,8 @@ export default function App() {
             )}
           </div>
 
-          <div className="bg-white p-5 rounded-xl shadow">
-            <h2 className="font-semibold mb-3">2. Bank Statement</h2>
+          <div className="bg-white dark:bg-slate-900 dark:border dark:border-slate-800 p-5 rounded-xl shadow dark:shadow-slate-950/50">
+            <h2 className="font-semibold mb-3 text-slate-900 dark:text-slate-100">2. Bank Statement</h2>
             <FileDrop
               label={stmtFile ? stmtFile.name : "Drop CSV / XLSX bank statement"}
               accept=".csv,.xlsx,.xls" onFiles={(f) => setStmtFile(f[0])}
@@ -375,9 +433,9 @@ export default function App() {
               </div>
             </details>
             <div className="mt-3 flex gap-2 items-center">
-              <label className="text-sm text-slate-600">Bank:</label>
+              <label className="text-sm text-slate-600 dark:text-slate-400">Bank:</label>
               <select value={bank} onChange={(e) => setBank(e.target.value)}
-                      className="border rounded px-2 py-1 text-sm">
+                      className="border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 dark:text-slate-100 rounded px-2 py-1 text-sm">
                 <option>Maybank</option><option>CIMB</option><option>Public Bank</option>
                 <option>HSBC</option><option>Wise</option><option>default</option>
               </select>
@@ -461,19 +519,37 @@ export default function App() {
           </div>
         </section>
 
-        <section className="grid md:grid-cols-2 gap-4">
-          <Inbox onIngest={appendProofs} />
-          <VoiceInput onProof={(p) => appendProofs([p])} />
+        {/* Secondary tools — collapsed by default so the main flow isn't cluttered */}
+        <section className="bg-white dark:bg-slate-900 dark:border dark:border-slate-800 rounded-xl shadow">
+          <button onClick={() => setToolsOpen(o => !o)}
+                  className="w-full px-5 py-3 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800/50 rounded-xl transition">
+            <div className="flex items-center gap-3">
+              <span className="text-lg">🧰</span>
+              <div>
+                <div className="font-semibold text-left">Tools</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400 text-left">
+                  Live inbox · Voice ingest · Sales validator · FX watcher · FX peak analyzer
+                </div>
+              </div>
+            </div>
+            <span className={`text-slate-400 transition-transform ${toolsOpen ? "rotate-180" : ""}`}>▼</span>
+          </button>
+          {toolsOpen && (
+            <div className="px-5 pb-5 space-y-4 border-t border-slate-200 dark:border-slate-800">
+              <div className="grid md:grid-cols-2 gap-4 pt-4">
+                <Inbox onIngest={appendProofs} />
+                <VoiceInput onProof={(p) => appendProofs([p])} />
+              </div>
+              <div className="grid md:grid-cols-2 gap-4">
+                <SalesValidator />
+                <FXWatcher />
+              </div>
+              <FXPeakAnalyzer />
+            </div>
+          )}
         </section>
 
-        <section className="grid md:grid-cols-2 gap-4">
-          <SalesValidator />
-          <FXWatcher />
-        </section>
-
-        <FXPeakAnalyzer />
-
-        <section className="bg-white p-5 rounded-xl shadow">
+        <section className="bg-white dark:bg-slate-900 dark:border dark:border-slate-800 p-5 rounded-xl shadow dark:shadow-slate-950/50">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <h2 className="font-semibold">3. Reconcile</h2>
             <div className="flex gap-2 items-center">
@@ -495,27 +571,27 @@ export default function App() {
           </div>
           {/* Inline checklist — replaces the silent disabled state */}
           {(!proofs.length || !txns.length) && !busy && (
-            <div className="mt-3 text-sm bg-amber-50 border border-amber-200 rounded p-2">
-              <div className="font-medium text-amber-900 mb-1">
+            <div className="mt-3 text-sm bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 rounded p-2">
+              <div className="font-medium text-amber-900 dark:text-amber-200 mb-1">
                 Before you can run the agent:
               </div>
               <ul className="text-xs space-y-0.5">
-                <li className={proofs.length ? "text-emerald-700" : "text-amber-800"}>
+                <li className={proofs.length ? "text-emerald-700 dark:text-emerald-300" : "text-amber-800 dark:text-amber-300"}>
                   {proofs.length ? "✓" : "○"} Payment proofs ({proofs.length} loaded)
                 </li>
-                <li className={txns.length ? "text-emerald-700" : "text-amber-800"}>
+                <li className={txns.length ? "text-emerald-700 dark:text-emerald-300" : "text-amber-800 dark:text-amber-300"}>
                   {txns.length ? "✓" : "○"} Bank statement transactions ({txns.length} loaded)
                 </li>
               </ul>
               <button onClick={loadSampleData}
-                      className="mt-2 text-xs text-indigo-700 hover:text-indigo-900 underline">
+                      className="mt-2 text-xs text-indigo-700 dark:text-indigo-300 hover:text-indigo-900 dark:hover:text-indigo-100 underline">
                 or skip the upload steps →
               </button>
             </div>
           )}
           {busy && (
             <div className="mt-3">
-              <div className="text-sm text-blue-700 flex items-center gap-2">
+              <div className="text-sm text-blue-700 dark:text-blue-300 flex items-center gap-2">
                 <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
                 {busy}
               </div>
@@ -562,14 +638,14 @@ export default function App() {
                 ["Soft matches", result.summary.soft_matches || 0, "purple"],
                 ["Discrepancies", result.summary.unmatched_proofs, "red"],
               ].map(([l, v, c]) => (
-                <div key={l} className="bg-white p-4 rounded-xl shadow text-center">
+                <div key={l} className="bg-white dark:bg-slate-900 dark:border dark:border-slate-800 p-4 rounded-xl shadow dark:shadow-slate-950/50 text-center">
                   <div className="text-2xl font-bold"><Pill color={c}>{v}</Pill></div>
-                  <div className="text-xs text-slate-500 mt-1">{l}</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">{l}</div>
                 </div>
               ))}
             </div>
 
-            <div className="bg-white p-5 rounded-xl shadow">
+            <div className="bg-white dark:bg-slate-900 dark:border dark:border-slate-800 p-5 rounded-xl shadow dark:shadow-slate-950/50">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="font-semibold">Reconciliation Results</h3>
                 <button onClick={downloadReport}
@@ -583,7 +659,7 @@ export default function App() {
                 <div className="mt-3 flex flex-wrap gap-2">
                   {result.matches.map((m, i) => (
                     <button key={i} onClick={() => downloadAuditPack(i)}
-                            className="text-xs px-3 py-1 bg-slate-200 text-slate-700 rounded hover:bg-slate-300">
+                            className="text-xs px-3 py-1 bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-200 rounded hover:bg-slate-300 dark:hover:bg-slate-700">
                       📚 Audit Pack: {m.proof.reference || `match ${i+1}`}
                     </button>
                   ))}
@@ -593,18 +669,18 @@ export default function App() {
               {/* Soft matches awaiting confirmation */}
               {result.soft_matches?.length > 0 && (
                 <div className="mt-6">
-                  <h3 className="font-semibold text-purple-700 mb-2">
+                  <h3 className="font-semibold text-purple-700 dark:text-purple-300 mb-2">
                     🔮 Soft matches — needs your blessing
                   </h3>
                   <ul className="space-y-2">
                     {result.soft_matches.map((s, i) => (
-                      <li key={i} className="bg-purple-50 border border-purple-200 rounded p-3">
+                      <li key={i} className="bg-purple-50 dark:bg-purple-950/30 border border-purple-200 dark:border-purple-900 rounded p-3">
                         <div className="flex justify-between gap-3">
                           <div className="flex-1">
                             <b>{s.proof.amount} {s.proof.currency}</b> from {s.proof.payer || "(unknown)"}
                             {" → "}
                             <b>{s.txn.amount} {s.txn.currency}</b> ({s.txn.description?.slice(0, 30)})
-                            <div className="text-xs text-purple-700 mt-1">
+                            <div className="text-xs text-purple-700 dark:text-purple-300 mt-1">
                               {s.signals.join(" · ")} — {(s.confidence * 100).toFixed(0)}% confident
                             </div>
                           </div>
@@ -622,21 +698,21 @@ export default function App() {
               {/* Discrepancies with SWIFT trace + dunning + boss chart */}
               {result.unmatched_proofs.length > 0 && (
                 <div className="mt-6">
-                  <h3 className="font-semibold text-red-700 mb-2">⚠ Discrepancies</h3>
+                  <h3 className="font-semibold text-red-700 dark:text-red-300 mb-2">⚠ Discrepancies</h3>
                   <ul className="space-y-3">
                     {result.unmatched_proofs.map((u, i) => (
-                      <li key={i} className="bg-red-50 p-3 rounded border border-red-200">
+                      <li key={i} className="bg-red-50 dark:bg-red-950/30 p-3 rounded border border-red-200 dark:border-red-900">
                         <div className="flex justify-between items-start gap-3">
                           <div>
                             <b>{u.source_file}</b> — {u.amount} {u.currency} on {u.date}
-                            <div className="text-xs text-red-700 mt-1">{u.reason}</div>
+                            <div className="text-xs text-red-700 dark:text-red-300 mt-1">{u.reason}</div>
                           </div>
                           <div className="flex flex-col gap-1">
                             <button onClick={() => setDunningTarget({
                               proof: u, expected: u.expected_net, actual: u.actual,
                               localCcy: u.closest_txn?.currency || "MYR",
                             })}
-                              className="text-xs px-3 py-1 bg-indigo-100 text-indigo-800 rounded hover:bg-indigo-200">
+                              className="text-xs px-3 py-1 bg-indigo-100 text-indigo-800 dark:bg-indigo-900/50 dark:text-indigo-200 rounded hover:bg-indigo-200 dark:hover:bg-indigo-900">
                               ✍️ Auto-dunning
                             </button>
                             {u.closest_txn && (
