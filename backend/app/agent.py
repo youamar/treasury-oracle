@@ -163,13 +163,22 @@ AGENT_KNOBS_DEFAULTS = {
 }
 
 
-def _resolve_knobs(platform_cfg: dict) -> dict:
-    """Return effective per-tenant knobs, falling back to module defaults."""
+def _resolve_knobs(platform_cfg: dict, bank: str | None = None) -> dict:
+    """Effective per-tenant knobs, with optional per-bank match_tolerance
+    override. Resolution order: bank → tenant → module default."""
     knobs = (platform_cfg or {}).get("agent_knobs") or {}
     out = dict(AGENT_KNOBS_DEFAULTS)
     for k, v in knobs.items():
         if k in out and v is not None:
             out[k] = v
+    # Per-bank match_tolerance override — bank registry trumps tenant default.
+    if bank:
+        try:
+            bank_row = db.get_bank(bank)
+            if bank_row and bank_row.get("match_tolerance") is not None:
+                out["match_tolerance"] = float(bank_row["match_tolerance"])
+        except Exception:
+            pass
     # Legacy compat — earlier code wrote some keys directly on cfg.
     for legacy_key in ("agent_temperature", "verifier_llm_enabled",
                        "verifier_model_profile"):
@@ -679,8 +688,8 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
                             "unmatched_txns": len(txns)},
                 "mode": "agent", "error": "no_tool_skills_enabled"}
 
-    # Resolve all per-tenant knobs once.
-    knobs = _resolve_knobs(platform_cfg)
+    # Resolve all per-tenant knobs once, with per-bank tolerance override.
+    knobs = _resolve_knobs(platform_cfg, bank=bank)
 
     # Effective temperature: explicit arg > config knob > default.
     if temperature is None:

@@ -305,6 +305,19 @@ CREATE TABLE IF NOT EXISTS calibrators (
     UNIQUE (tenant_id, scope)
 );
 
+CREATE TABLE IF NOT EXISTS fx_fallback_rates (
+    -- Hand-maintained FX rates used when both live providers fail. Tagged
+    -- as untrusted in get_fx_rate_full so the agent never strict-matches
+    -- against them. Editable per-tenant so customers can keep them fresh.
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    from_ccy TEXT NOT NULL,
+    to_ccy TEXT NOT NULL,
+    rate REAL NOT NULL,
+    asof TEXT,                    -- date the rate was current (informational)
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, from_ccy, to_ccy)
+);
+
 CREATE TABLE IF NOT EXISTS breaker_states (
     -- Persisted circuit-breaker state per upstream source. Stored centrally
     -- (not per-tenant) because the upstream LLM is shared across tenants;
@@ -1237,6 +1250,97 @@ def list_live_fixtures(limit: int = 200) -> list[dict]:
         d["txn_candidates"] = json.loads(d["txn_candidates_json"])
         out.append(d)
     return out
+
+
+# ---------- FX fallback rates (editable per-tenant) ----------
+
+# Module-level cache so the agent's hot path doesn't pay a DB hit per FX
+# lookup. Invalidated by upsert/delete and on test setup via reset_all.
+_fx_fallback_cache: dict[tuple[str, str, str], float] = {}
+
+
+def _seed_default_fx_fallback(tenant_id: str) -> None:
+    """First read per tenant — copy the static table from tools.py so the
+    customer sees rows they can edit. Idempotent."""
+    seed = {
+        ("USD", "MYR"): 4.72, ("EUR", "MYR"): 5.10, ("SGD", "MYR"): 3.52,
+        ("GBP", "MYR"): 5.95, ("JPY", "MYR"): 0.031, ("CNY", "MYR"): 0.65,
+        ("USD", "SGD"): 1.34, ("USD", "EUR"): 0.92, ("USD", "GBP"): 0.79,
+    }
+    now = _now()
+    with conn() as c:
+        for (f, t), rate in seed.items():
+            c.execute(
+                "INSERT OR IGNORE INTO fx_fallback_rates"
+                "(tenant_id, from_ccy, to_ccy, rate, asof, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (tenant_id, f, t, float(rate), None, now),
+            )
+
+
+def list_fx_fallback_rates() -> list[dict]:
+    t = _t()
+    _seed_default_fx_fallback(t)
+    with conn() as c:
+        rows = c.execute(
+            "SELECT * FROM fx_fallback_rates WHERE tenant_id = ? "
+            "ORDER BY from_ccy, to_ccy", (t,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_fx_fallback_rate(from_ccy: str, to_ccy: str) -> float | None:
+    t = _t()
+    from_ccy = from_ccy.upper()
+    to_ccy = to_ccy.upper()
+    key = (t, from_ccy, to_ccy)
+    if key in _fx_fallback_cache:
+        return _fx_fallback_cache[key]
+    _seed_default_fx_fallback(t)
+    with conn() as c:
+        r = c.execute(
+            "SELECT rate FROM fx_fallback_rates "
+            "WHERE tenant_id = ? AND from_ccy = ? AND to_ccy = ?",
+            (t, from_ccy, to_ccy),
+        ).fetchone()
+    rate = float(r["rate"]) if r else None
+    _fx_fallback_cache[key] = rate
+    return rate
+
+
+def upsert_fx_fallback_rate(from_ccy: str, to_ccy: str, rate: float,
+                            asof: str | None = None) -> dict:
+    t = _t()
+    from_ccy = from_ccy.upper()
+    to_ccy = to_ccy.upper()
+    now = _now()
+    with conn() as c:
+        c.execute(
+            "INSERT INTO fx_fallback_rates(tenant_id, from_ccy, to_ccy, "
+            "rate, asof, updated_at) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(tenant_id, from_ccy, to_ccy) DO UPDATE SET "
+            "rate=excluded.rate, asof=excluded.asof, updated_at=excluded.updated_at",
+            (t, from_ccy, to_ccy, float(rate), asof, now),
+        )
+    # Clear cache for this triplet so the next read sees the new value.
+    _fx_fallback_cache.pop((t, from_ccy, to_ccy), None)
+    _fx_fallback_cache.pop((t, to_ccy, from_ccy), None)  # inverse may be derived
+    return {"tenant_id": t, "from_ccy": from_ccy, "to_ccy": to_ccy,
+            "rate": rate, "asof": asof, "updated_at": now}
+
+
+def delete_fx_fallback_rate(from_ccy: str, to_ccy: str) -> None:
+    t = _t()
+    from_ccy = from_ccy.upper()
+    to_ccy = to_ccy.upper()
+    with conn() as c:
+        c.execute(
+            "DELETE FROM fx_fallback_rates "
+            "WHERE tenant_id = ? AND from_ccy = ? AND to_ccy = ?",
+            (t, from_ccy, to_ccy),
+        )
+    _fx_fallback_cache.pop((t, from_ccy, to_ccy), None)
+    _fx_fallback_cache.pop((t, to_ccy, from_ccy), None)
 
 
 # ---------- circuit breaker state (shared across workers) ----------

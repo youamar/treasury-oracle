@@ -50,6 +50,18 @@ def _fx_lookup_cached(from_ccy: str, to_ccy: str, date: str) -> tuple[float, str
     except Exception:
         pass
 
+    # DB-backed fallback rates take priority over the in-code static table —
+    # customers can keep them fresh from the Settings UI. Untrusted either way.
+    try:
+        from . import db as _db
+        rate = _db.get_fx_fallback_rate(from_ccy, to_ccy)
+        if rate is not None:
+            return rate, FX_SOURCE_STATIC
+        inv = _db.get_fx_fallback_rate(to_ccy, from_ccy)
+        if inv is not None and inv != 0:
+            return 1.0 / inv, FX_SOURCE_STATIC
+    except Exception:
+        pass
     if (from_ccy, to_ccy) in _STATIC_RATES:
         return _STATIC_RATES[(from_ccy, to_ccy)], FX_SOURCE_STATIC
     if (to_ccy, from_ccy) in _STATIC_RATES:
@@ -101,6 +113,18 @@ def _fx_lookup_uncached(from_ccy: str, to_ccy: str, date: str) -> tuple[float, s
             data = r.json()
             if "rates" in data and to_ccy in data["rates"]:
                 return float(data["rates"][to_ccy]), FX_SOURCE_EXR
+    except Exception:
+        pass
+    # DB-backed fallback rates take priority over the in-code static table —
+    # customers can keep them fresh from the Settings UI. Untrusted either way.
+    try:
+        from . import db as _db
+        rate = _db.get_fx_fallback_rate(from_ccy, to_ccy)
+        if rate is not None:
+            return rate, FX_SOURCE_STATIC
+        inv = _db.get_fx_fallback_rate(to_ccy, from_ccy)
+        if inv is not None and inv != 0:
+            return 1.0 / inv, FX_SOURCE_STATIC
     except Exception:
         pass
     if (from_ccy, to_ccy) in _STATIC_RATES:

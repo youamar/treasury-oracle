@@ -152,6 +152,32 @@ def delete_bank(bank_id: str):
     return {"ok": True}
 
 
+# ---------- FX fallback rates (C-6) ----------
+
+class FxFallbackBody(BaseModel):
+    from_ccy: str
+    to_ccy: str
+    rate: float
+    asof: str | None = None
+
+
+@app.get("/api/fx/fallback")
+def list_fx_fallback():
+    return {"rates": db.list_fx_fallback_rates()}
+
+
+@app.put("/api/fx/fallback")
+def upsert_fx_fallback(body: FxFallbackBody):
+    return db.upsert_fx_fallback_rate(body.from_ccy, body.to_ccy,
+                                      body.rate, body.asof)
+
+
+@app.delete("/api/fx/fallback/{from_ccy}/{to_ccy}")
+def delete_fx_fallback(from_ccy: str, to_ccy: str):
+    db.delete_fx_fallback_rate(from_ccy, to_ccy)
+    return {"ok": True}
+
+
 # ---------- core pipeline ----------
 
 @app.post("/api/extract-proofs")
