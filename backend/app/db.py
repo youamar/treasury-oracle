@@ -305,6 +305,19 @@ CREATE TABLE IF NOT EXISTS calibrators (
     UNIQUE (tenant_id, scope)
 );
 
+CREATE TABLE IF NOT EXISTS breaker_states (
+    -- Persisted circuit-breaker state per upstream source. Stored centrally
+    -- (not per-tenant) because the upstream LLM is shared across tenants;
+    -- when Chutes is down everyone sees the same breaker.
+    source TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'closed',  -- closed | open | half_open
+    opened_at_epoch REAL NOT NULL DEFAULT 0.0,
+    half_open_in_flight INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS banks (
     -- Per-tenant bank registry. Pre-seeded with the historical BANK_FEES
     -- dict on first boot per tenant; customers can edit / add / delete.
@@ -1224,6 +1237,65 @@ def list_live_fixtures(limit: int = 200) -> list[dict]:
         d["txn_candidates"] = json.loads(d["txn_candidates_json"])
         out.append(d)
     return out
+
+
+# ---------- circuit breaker state (shared across workers) ----------
+
+def get_breaker_state(source: str) -> dict:
+    """Returns the current row for `source`, defaulting to a closed state.
+    Not per-tenant — breaker is global to the upstream."""
+    with conn() as c:
+        r = c.execute(
+            "SELECT failures, state, opened_at_epoch, half_open_in_flight, "
+            "last_error FROM breaker_states WHERE source = ?",
+            (source,),
+        ).fetchone()
+    if r is None:
+        return {"source": source, "failures": 0, "state": "closed",
+                "opened_at_epoch": 0.0, "half_open_in_flight": 0,
+                "last_error": ""}
+    d = dict(r)
+    d["source"] = source
+    return d
+
+
+def save_breaker_state(source: str, **fields) -> None:
+    """Upsert the breaker row. Caller passes any subset of the columns;
+    omitted ones fall back to the existing row (or defaults)."""
+    cur = get_breaker_state(source)
+    cur.update(fields)
+    with conn() as c:
+        c.execute(
+            "INSERT INTO breaker_states"
+            "(source, failures, state, opened_at_epoch, half_open_in_flight, "
+            "last_error, updated_at) "
+            "VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(source) DO UPDATE SET "
+            "failures=excluded.failures, state=excluded.state, "
+            "opened_at_epoch=excluded.opened_at_epoch, "
+            "half_open_in_flight=excluded.half_open_in_flight, "
+            "last_error=excluded.last_error, updated_at=excluded.updated_at",
+            (source, int(cur["failures"]), cur["state"],
+             float(cur["opened_at_epoch"]), int(cur["half_open_in_flight"]),
+             str(cur["last_error"])[:300], _now()),
+        )
+
+
+def list_breaker_states() -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT source, failures, state, opened_at_epoch, "
+            "half_open_in_flight, last_error, updated_at FROM breaker_states"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_breaker_state(source: str | None = None) -> None:
+    with conn() as c:
+        if source is None:
+            c.execute("DELETE FROM breaker_states")
+        else:
+            c.execute("DELETE FROM breaker_states WHERE source = ?", (source,))
 
 
 # ---------- banks (per-tenant editable BANK_FEES + tolerance) ----------

@@ -216,3 +216,53 @@ def test_chutes_chat_swaps_on_auth_error(monkeypatch):
     out = cc.chat([{"role": "user", "content": "hi"}], model="m")
     assert out == "ok"
     assert calls["fallback"] == 1
+
+
+def test_breaker_state_persists_in_db():
+    """R-3: breaker state is written to SQLite, not a module dict."""
+    from app import reliability as rel, db
+    # Reset any prior state for this source so the test is hermetic.
+    db.delete_breaker_state("test.db.breaker")
+    rel.configure_breaker("test.db.breaker", rel.BreakerConfig(
+        failure_threshold=2, cooldown_seconds=999))
+
+    # Two retryable failures should open the breaker.
+    err = _StatusErr(503)
+    rel._record_outcome("test.db.breaker", ok=False, err=err)
+    rel._record_outcome("test.db.breaker", ok=False, err=err)
+
+    # State is in the DB, not just the process.
+    row = db.get_breaker_state("test.db.breaker")
+    assert row["state"] == "open"
+    assert row["failures"] == 2
+
+    # And the snapshot endpoint sees it.
+    snap = rel.breaker_snapshot()
+    src_row = next((s for s in snap if s["source"] == "test.db.breaker"), None)
+    assert src_row is not None
+    assert src_row["state"] == "open"
+
+
+def test_breaker_admit_rejects_when_open():
+    """Once open, _admit raises BreakerOpen until cooldown elapses."""
+    from app import reliability as rel, db
+    db.delete_breaker_state("test.admit.open")
+    rel.configure_breaker("test.admit.open", rel.BreakerConfig(
+        failure_threshold=1, cooldown_seconds=999))
+    # Push to open
+    rel._record_outcome("test.admit.open", ok=False, err=_StatusErr(503))
+    import pytest
+    with pytest.raises(rel.BreakerOpen):
+        rel._admit("test.admit.open")
+
+
+def test_breaker_success_closes_after_recovery():
+    """A successful call clears failures and returns the breaker to closed."""
+    from app import reliability as rel, db
+    db.delete_breaker_state("test.recover")
+    rel.configure_breaker("test.recover", rel.BreakerConfig(
+        failure_threshold=2, cooldown_seconds=1))
+    rel._record_outcome("test.recover", ok=False, err=_StatusErr(503))
+    rel._record_outcome("test.recover", ok=True)
+    assert db.get_breaker_state("test.recover")["state"] == "closed"
+    assert db.get_breaker_state("test.recover")["failures"] == 0

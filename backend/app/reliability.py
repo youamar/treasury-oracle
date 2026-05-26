@@ -117,7 +117,10 @@ class BreakerOpen(Exception):
         self.remaining_cooldown = remaining_cooldown
 
 
-_breakers: dict[str, _BreakerState] = {}
+# Breaker state is now persisted to SQLite (db.breaker_states) so multiple
+# uvicorn workers and process restarts see the same view. The in-memory
+# lock below only serializes admit/record_outcome inside this process —
+# SQLite's busy_timeout handles cross-process serialization at the file level.
 _breaker_lock = threading.Lock()
 _breaker_cfg: dict[str, BreakerConfig] = {}
 _default_breaker_cfg = BreakerConfig()
@@ -133,76 +136,88 @@ def _cfg(source: str) -> BreakerConfig:
 
 
 def _admit(source: str) -> None:
-    """Raise BreakerOpen if the breaker for `source` rejects this call now."""
+    """Raise BreakerOpen if the breaker for `source` rejects this call now.
+    State is read from and written to db.breaker_states under a per-process
+    lock so concurrent calls in the same worker don't race; cross-worker
+    races are bounded by the cooldown window which is much longer than the
+    transaction window."""
     cfg = _cfg(source)
-    now = time.monotonic()
+    from . import db
     with _breaker_lock:
-        st = _breakers.setdefault(source, _BreakerState())
-        if st.state == "open":
-            elapsed = now - st.opened_at
+        st = db.get_breaker_state(source)
+        now_epoch = time.time()
+        if st["state"] == "open":
+            elapsed = now_epoch - st["opened_at_epoch"]
             if elapsed >= cfg.cooldown_seconds:
-                st.state = "half_open"
-                st.half_open_in_flight = 0
+                # Cooldown elapsed — transition to half-open and let this call probe.
+                db.save_breaker_state(source, state="half_open",
+                                      half_open_in_flight=1)
             else:
                 raise BreakerOpen(source, cfg.cooldown_seconds - elapsed)
-        if st.state == "half_open":
-            if st.half_open_in_flight >= cfg.half_open_max_calls:
+        elif st["state"] == "half_open":
+            if st["half_open_in_flight"] >= cfg.half_open_max_calls:
                 raise BreakerOpen(source, 0.0)
-            st.half_open_in_flight += 1
+            db.save_breaker_state(source,
+                                  half_open_in_flight=st["half_open_in_flight"] + 1)
 
 
 def _record_outcome(source: str, ok: bool, err: BaseException | None = None) -> None:
     cfg = _cfg(source)
+    from . import db
     with _breaker_lock:
-        st = _breakers.setdefault(source, _BreakerState())
+        st = db.get_breaker_state(source)
         if ok:
-            st.failures = 0
-            st.state = "closed"
-            st.half_open_in_flight = 0
-            st.last_error = ""
+            db.save_breaker_state(source, failures=0, state="closed",
+                                  half_open_in_flight=0, last_error="")
             return
-        # only count breaker-eligible failures (retryable or auth)
-        st.last_error = f"{type(err).__name__}: {err}"[:200] if err else ""
+        last_error = f"{type(err).__name__}: {err}"[:200] if err else ""
         if err is not None and not (is_retryable(err) or is_auth_error(err)):
+            # Only update the message so operators can see context, but
+            # don't count it toward the failure threshold.
+            db.save_breaker_state(source, last_error=last_error)
             return
-        st.failures += 1
-        if st.state == "half_open":
-            st.state = "open"
-            st.opened_at = time.monotonic()
-            st.half_open_in_flight = 0
+        new_failures = st["failures"] + 1
+        if st["state"] == "half_open":
+            # A failure during half-open re-opens immediately.
+            db.save_breaker_state(source, failures=new_failures, state="open",
+                                  opened_at_epoch=time.time(),
+                                  half_open_in_flight=0,
+                                  last_error=last_error)
             return
-        if st.failures >= cfg.failure_threshold:
-            st.state = "open"
-            st.opened_at = time.monotonic()
+        if new_failures >= cfg.failure_threshold:
+            db.save_breaker_state(source, failures=new_failures, state="open",
+                                  opened_at_epoch=time.time(),
+                                  last_error=last_error)
+        else:
+            db.save_breaker_state(source, failures=new_failures,
+                                  last_error=last_error)
 
 
 def breaker_snapshot() -> list[dict]:
+    from . import db
+    now_epoch = time.time()
     out = []
-    now = time.monotonic()
-    with _breaker_lock:
-        for src, st in _breakers.items():
-            cfg = _cfg(src)
-            remaining = 0.0
-            if st.state == "open":
-                remaining = max(0.0, cfg.cooldown_seconds - (now - st.opened_at))
-            out.append({
-                "source": src,
-                "state": st.state,
-                "failures": st.failures,
-                "remaining_cooldown_seconds": round(remaining, 2),
-                "last_error": st.last_error,
-                "failure_threshold": cfg.failure_threshold,
-                "cooldown_seconds": cfg.cooldown_seconds,
-            })
+    for st in db.list_breaker_states():
+        cfg = _cfg(st["source"])
+        remaining = 0.0
+        if st["state"] == "open":
+            remaining = max(0.0, cfg.cooldown_seconds - (now_epoch - st["opened_at_epoch"]))
+        out.append({
+            "source": st["source"],
+            "state": st["state"],
+            "failures": st["failures"],
+            "remaining_cooldown_seconds": round(remaining, 2),
+            "last_error": st["last_error"],
+            "updated_at": st.get("updated_at"),
+            "failure_threshold": cfg.failure_threshold,
+            "cooldown_seconds": cfg.cooldown_seconds,
+        })
     return out
 
 
 def reset_breaker(source: str | None = None) -> None:
-    with _breaker_lock:
-        if source is None:
-            _breakers.clear()
-        else:
-            _breakers.pop(source, None)
+    from . import db
+    db.delete_breaker_state(source)
 
 
 def with_retry(fn: Callable[[], Any], *, policy: RetryPolicy = DEFAULT_POLICY,
