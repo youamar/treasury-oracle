@@ -73,6 +73,57 @@ def reset_config():
     return platform_config.reset_to_defaults()
 
 
+# ---------- per-tenant agent knobs (C-1, C-3, C-4) ----------
+
+class AgentKnobs(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    max_steps: int | None = None
+    date_window_days: int | None = None
+    reflection_confidence_threshold: float | None = None
+    reflection_max_cycles: int | None = None
+    verifier_strict_diff_pct: float | None = None
+    verifier_strict_days_off: int | None = None
+    verifier_min_tool_calls_for_strict: int | None = None
+    match_tolerance: float | None = None
+    agent_temperature: float | None = None
+    verifier_llm_enabled: bool | None = None
+    verifier_model_profile: str | None = None
+    base_prompt: str | None = None
+
+
+@router.get("/agent-knobs")
+def get_agent_knobs():
+    from .agent import AGENT_KNOBS_DEFAULTS, _BASE_PROMPT
+    cfg = platform_config.load_config()
+    current = (cfg.get("agent_knobs") or {})
+    return {
+        "defaults": AGENT_KNOBS_DEFAULTS,
+        "current": current,
+        "default_base_prompt": _BASE_PROMPT,
+    }
+
+
+@router.put("/agent-knobs")
+def put_agent_knobs(body: AgentKnobs):
+    """Per-tenant overrides for agent step budget, reflection thresholds,
+    verifier thresholds, match tolerance, temperature, and the base agent
+    prompt. Any field omitted (or null) keeps the existing override (or
+    falls through to the built-in default if no override is set)."""
+    cfg = platform_config.load_config()
+    knobs = dict(cfg.get("agent_knobs") or {})
+    for k, v in body.model_dump(exclude_none=True).items():
+        knobs[k] = v
+    cfg["agent_knobs"] = knobs
+    return platform_config.save_config(cfg)
+
+
+@router.post("/agent-knobs/reset")
+def reset_agent_knobs():
+    cfg = platform_config.load_config()
+    cfg["agent_knobs"] = {}
+    return platform_config.save_config(cfg)
+
+
 # ---------- Per-skill update ----------
 
 class SkillUpdate(BaseModel):

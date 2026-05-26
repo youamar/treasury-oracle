@@ -579,3 +579,85 @@ def test_reflection_does_not_loop_unbounded(sample_proof, sample_txn, monkeypatc
     # Must finish, not hang or exhaust step budget into a no_match fallback.
     summary = out["summary"]
     assert summary["matched"] + summary["soft_matches"] == 1
+
+
+def test_agent_knob_max_steps_takes_effect(sample_proof, sample_txn, monkeypatch):
+    """Per-tenant max_steps in platform_config caps the loop length."""
+    import json
+    from app import agent as agent_mod, platform_config
+
+    # Always emit a tool call so the agent never finishes — without a cap it
+    # would loop until MAX_STEPS. With max_steps=2 we expect the exhausted
+    # branch to fire and return the no_match fallback.
+    looping = {"tool_calls": [{"name": "get_fx_rate",
+                               "arguments": {"from_ccy": "USD", "to_ccy": "MYR",
+                                             "date": "2026-05-20"}}]}
+    monkeypatch.setattr(agent_mod, "get_client",
+                        lambda use_fallback=False: _make_client([looping]))
+
+    cfg = platform_config.load_config()
+    cfg["agent_knobs"] = {"max_steps": 2}
+    platform_config.save_config(cfg)
+
+    out = agent_mod.reconcile_agent([sample_proof], [sample_txn], "Maybank")
+    # Fallback should fire — agent never reached a decision in 2 steps.
+    up = out["unmatched_proofs"][0] if out["unmatched_proofs"] else None
+    assert up is not None
+    assert "Agent: no match" in up["reason"] or "exhausted" in (up["reason"] or "").lower()
+
+
+def test_agent_knob_base_prompt_overrides_builtin(sample_proof, sample_txn, monkeypatch):
+    """Custom base prompt makes its way into the assistant message stream."""
+    from app import agent as agent_mod, platform_config
+
+    captured_messages = []
+    class _Capture:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(messages=None, **kw):
+                    captured_messages.extend(messages or [])
+                    import json
+                    class _M:
+                        content = json.dumps({"decision": "no_match", "confidence": 0,
+                                              "reasoning": "stub"})
+                        tool_calls = None
+                    class _R: choices = [type("C", (), {"message": _M})]
+                    return _R()
+    monkeypatch.setattr(agent_mod, "get_client", lambda use_fallback=False: _Capture())
+
+    cfg = platform_config.load_config()
+    cfg["agent_knobs"] = {"base_prompt": "TEST_BASE_PROMPT_MARKER_ABC123"}
+    platform_config.save_config(cfg)
+
+    agent_mod.reconcile_agent([sample_proof], [sample_txn], "Maybank")
+    system_msgs = [m for m in captured_messages if m.get("role") == "system"]
+    assert any("TEST_BASE_PROMPT_MARKER_ABC123" in (m.get("content") or "")
+               for m in system_msgs), "custom base prompt not threaded into system message"
+
+
+def test_agent_knobs_endpoints():
+    """Round-trip per-tenant knobs via the platform API."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+
+    # GET returns defaults + current
+    r = client.get("/api/platform/agent-knobs")
+    assert r.status_code == 200
+    j = r.json()
+    assert "max_steps" in j["defaults"]
+    assert j["default_base_prompt"]  # built-in prompt is exposed
+
+    # PUT sets specific knobs; only those keys land in config.
+    r = client.put("/api/platform/agent-knobs",
+                   json={"max_steps": 9, "match_tolerance": 0.03})
+    assert r.status_code == 200
+    new_cfg = r.json()
+    assert new_cfg["agent_knobs"]["max_steps"] == 9
+    assert new_cfg["agent_knobs"]["match_tolerance"] == 0.03
+
+    # Reset wipes overrides
+    r = client.post("/api/platform/agent-knobs/reset")
+    assert r.status_code == 200
+    assert r.json()["agent_knobs"] == {}

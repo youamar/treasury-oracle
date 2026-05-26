@@ -135,18 +135,47 @@ DEFAULT_AGENT_TEMPERATURE = 0.1   # production default
 EVAL_AGENT_TEMPERATURE = 0.0      # used during eval runs for reproducibility
 
 # Reflection — when the agent's first decision is shaky, we let it re-plan
-# once. Triggers below cover the patterns we've actually seen in eval runs:
-# low confidence claims, soft/discrepancy without the relevant tool calls,
-# strict claims without any FX lookup.
+# once. Triggers below cover the patterns we've actually seen in eval runs.
 REFLECTION_CONFIDENCE_THRESHOLD = 0.7
 REFLECTION_MAX_CYCLES = 1  # cap so a confused LLM can't burn the step budget
 
 # Verifier (F2) — second-pass skeptic that audits the agent's proposed decision.
-# Currently deterministic (free, zero extra tokens); an LLM-backed verifier can
-# be plugged into the same hook later.
 VERIFIER_STRICT_DIFF_PCT = 0.005        # >0.5% diff is unusual for a 'strict' claim
 VERIFIER_STRICT_DAYS_OFF = 2            # date gap that should be a 'soft' not 'strict'
 VERIFIER_MIN_TOOL_CALLS_FOR_STRICT = 1  # an LLM jumping straight to strict is suspect
+
+
+# Per-tenant overrides — every constant above can be set in platform_config
+# under the corresponding key. Resolved once per reconcile_agent call.
+AGENT_KNOBS_DEFAULTS = {
+    "max_steps":                          MAX_STEPS,
+    "date_window_days":                   DATE_WINDOW_DAYS,
+    "reflection_confidence_threshold":    REFLECTION_CONFIDENCE_THRESHOLD,
+    "reflection_max_cycles":              REFLECTION_MAX_CYCLES,
+    "verifier_strict_diff_pct":           VERIFIER_STRICT_DIFF_PCT,
+    "verifier_strict_days_off":           VERIFIER_STRICT_DAYS_OFF,
+    "verifier_min_tool_calls_for_strict": VERIFIER_MIN_TOOL_CALLS_FOR_STRICT,
+    "match_tolerance":                    MATCH_TOLERANCE,
+    "agent_temperature":                  DEFAULT_AGENT_TEMPERATURE,
+    "verifier_llm_enabled":               True,
+    "verifier_model_profile":             "cheap",
+    "base_prompt":                        None,  # None → use built-in
+}
+
+
+def _resolve_knobs(platform_cfg: dict) -> dict:
+    """Return effective per-tenant knobs, falling back to module defaults."""
+    knobs = (platform_cfg or {}).get("agent_knobs") or {}
+    out = dict(AGENT_KNOBS_DEFAULTS)
+    for k, v in knobs.items():
+        if k in out and v is not None:
+            out[k] = v
+    # Legacy compat — earlier code wrote some keys directly on cfg.
+    for legacy_key in ("agent_temperature", "verifier_llm_enabled",
+                       "verifier_model_profile"):
+        if legacy_key in (platform_cfg or {}):
+            out[legacy_key] = platform_cfg[legacy_key]
+    return out
 
 
 def _payer_overlap(payer: str | None, txn_desc: str | None) -> bool:
@@ -170,19 +199,14 @@ def _reference_overlap(proof_ref: str | None, txn_ref: str | None,
 
 
 def _verify_decision(decision: dict, proof: dict, chosen: dict | None,
-                     bank: str) -> dict:
-    """Deterministic skeptic pass. Returns:
+                     bank: str, knobs: dict | None = None) -> dict:
+    """Deterministic skeptic pass. Thresholds resolved from `knobs`
+    (per-tenant) when provided, else module defaults."""
+    k = knobs or AGENT_KNOBS_DEFAULTS
+    diff_ceiling = float(k["verifier_strict_diff_pct"])
+    days_ceiling = int(k["verifier_strict_days_off"])
+    min_tools = int(k["verifier_min_tool_calls_for_strict"])
 
-        {
-          "ran": True,
-          "verdict": "confirm" | "downgrade" | "skip",
-          "concerns": [str, ...],
-          "method": "programmatic_skeptic_v1"
-        }
-
-    For non-strict decisions it returns verdict='skip' (nothing to audit).
-    For strict decisions: any concern triggers verdict='downgrade'.
-    """
     d = decision.get("decision")
     if d != "strict" or chosen is None:
         return {"ran": False, "verdict": "skip", "concerns": [],
@@ -190,41 +214,35 @@ def _verify_decision(decision: dict, proof: dict, chosen: dict | None,
 
     concerns: list[str] = []
 
-    # 1) Diff% larger than verifier's stricter ceiling — agent's 2% match
-    # tolerance may be config, but for a STRICT claim we want a much tighter fit.
     expected = float(decision.get("expected_net") or 0)
     actual = float(decision.get("actual") or chosen.get("amount") or 0)
     if expected > 0:
         diff_pct = abs(actual - expected) / expected
-        if diff_pct > VERIFIER_STRICT_DIFF_PCT:
+        if diff_pct > diff_ceiling:
             concerns.append(
                 f"strict claimed but diff is {diff_pct*100:.2f}% — above "
-                f"verifier ceiling {VERIFIER_STRICT_DIFF_PCT*100:.2f}%"
+                f"verifier ceiling {diff_ceiling*100:.2f}%"
             )
 
-    # 2) Date gap — same-day payments are most likely strict; multi-day gaps
-    # commonly mean a fee/FX adjustment landed late, not a clean match.
     try:
         from datetime import date as _d
         pd_ = _d.fromisoformat(proof.get("date"))
         td_ = _d.fromisoformat(chosen.get("date"))
         days_off = abs((pd_ - td_).days)
-        if days_off > VERIFIER_STRICT_DAYS_OFF:
+        if days_off > days_ceiling:
             concerns.append(
                 f"strict claimed but proof and txn are {days_off} days apart "
-                f"(verifier wants ≤{VERIFIER_STRICT_DAYS_OFF})"
+                f"(verifier wants ≤{days_ceiling})"
             )
     except Exception:
         pass
 
-    # 3) No supporting tool calls — LLM jumped straight to strict without
-    # actually calling get_fx_rate / fuzzy_compare. Hallucination risk.
     tool_calls = decision.get("tool_calls") or []
     n_substantive = sum(
         1 for tc in tool_calls
         if tc.get("name") in {"get_fx_rate", "apply_bank_fee", "fuzzy_compare"}
     )
-    if n_substantive < VERIFIER_MIN_TOOL_CALLS_FOR_STRICT:
+    if n_substantive < min_tools:
         concerns.append(
             f"strict claimed without any FX/fee/fuzzy tool call — "
             f"agent answered from priors only"
@@ -304,8 +322,12 @@ Be decisive. Do not call the same tool twice with identical arguments."""
 
 
 def _compose_system_prompt(tool_skills: list, platform_cfg: dict) -> str:
-    """Merge base prompt with per-skill usage guidance."""
-    sections = [_BASE_PROMPT, "", "Tool usage guidance:"]
+    """Merge base prompt with per-skill usage guidance. The base prompt is
+    editable per-tenant via platform_config['agent_knobs']['base_prompt']
+    — falls back to the built-in _BASE_PROMPT when not set."""
+    knobs = (platform_cfg or {}).get("agent_knobs") or {}
+    base = knobs.get("base_prompt") or _BASE_PROMPT
+    sections = [base, "", "Tool usage guidance:"]
     for s in tool_skills:
         sc = resolve_skill_config(s, platform_cfg)
         sections.append(f"- {s.id}: {sc.get('system_prompt', '').strip()}")
@@ -382,7 +404,9 @@ def _dispatch_skill(skill_id: str, args: dict, ctx: SkillContext) -> Any:
 # ---------- The agent loop ----------
 
 def _should_reflect(decision: dict, tool_calls_made: list[dict],
-                    enabled_skill_ids: set[str]) -> tuple[bool, str]:
+                    enabled_skill_ids: set[str],
+                    confidence_threshold: float = REFLECTION_CONFIDENCE_THRESHOLD
+                    ) -> tuple[bool, str]:
     """Decide whether the agent's first decision warrants a re-plan pass.
 
     Returns (do_reflect, nudge_message). The nudge is appended as a user
@@ -427,11 +451,11 @@ def _should_reflect(decision: dict, tool_calls_made: list[dict],
 
     # Low confidence on ANY decision — invite recall_facts to surface
     # previously-learned patterns about this payer / currency pair.
-    if conf < REFLECTION_CONFIDENCE_THRESHOLD and \
+    if conf < confidence_threshold and \
             "recall_facts" in enabled_skill_ids and \
             "recall_facts" not in tools_used:
         return True, (
-            f"Your confidence ({conf:.2f}) is below the {REFLECTION_CONFIDENCE_THRESHOLD} "
+            f"Your confidence ({conf:.2f}) is below the {confidence_threshold} "
             "reflection threshold. Call recall_facts on the payer name and "
             "the currency pair to surface anything the platform has learned "
             "from previous runs, then re-decide."
@@ -443,7 +467,12 @@ def _should_reflect(decision: dict, tool_calls_made: list[dict],
 def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
                    session_id: str, proof_idx: int,
                    platform_cfg: dict, tool_skills: list,
-                   temperature: float = DEFAULT_AGENT_TEMPERATURE) -> dict:
+                   temperature: float = DEFAULT_AGENT_TEMPERATURE,
+                   knobs: dict | None = None) -> dict:
+    knobs = knobs or _resolve_knobs(platform_cfg)
+    max_steps = int(knobs["max_steps"])
+    reflection_threshold = float(knobs["reflection_confidence_threshold"])
+    reflection_max = int(knobs["reflection_max_cycles"])
     system_prompt = _compose_system_prompt(tool_skills, platform_cfg)
     tool_specs = [s.to_openai_tool() for s in tool_skills]
 
@@ -463,7 +492,7 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
     reflection_history: list[dict] = []  # each entry: {step, trigger, prior_decision}
     enabled_skill_ids = {s.id for s in tool_skills}
 
-    for _ in range(MAX_STEPS):
+    for _ in range(max_steps):
         step += 1
         t0 = time.perf_counter()
         try:
@@ -560,8 +589,10 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
             # initial decision shows red flags (low confidence, missing
             # critical tool calls). Bounded by REFLECTION_MAX_CYCLES so we
             # can't burn the whole step budget on second-guessing.
-            if reflection_cycles < REFLECTION_MAX_CYCLES:
-                should, nudge = _should_reflect(final, tool_call_log, enabled_skill_ids)
+            if reflection_cycles < reflection_max:
+                should, nudge = _should_reflect(final, tool_call_log,
+                                                enabled_skill_ids,
+                                                confidence_threshold=reflection_threshold)
                 if should:
                     reflection_cycles += 1
                     reflection_history.append({
@@ -597,7 +628,7 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
         })
 
     db.append_trace(session_id, proof.get("source_file"), step, "exhausted",
-                    {"max_steps": MAX_STEPS})
+                    {"max_steps": max_steps})
     return {"decision": "no_match", "confidence": 0.0, "fallback": True,
             "reasoning": "Agent exhausted step budget without deciding.",
             "tool_calls": tool_call_log}
@@ -619,9 +650,6 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
     `agent_temperature` is used, falling back to DEFAULT_AGENT_TEMPERATURE.
     """
     sid = session_id or str(uuid.uuid4())[:8]
-    # Inbound payments only — outbound rows (refunds, fees) should never
-    # match against a payment proof. Rows lacking direction (legacy callers)
-    # are assumed inbound to preserve back-compat.
     txns = [t for t in txns if t.get("direction", "in") == "in"]
     platform_cfg = config_override or platform_config.load_config()
     tool_skills = enabled_tool_skills(platform_cfg)
@@ -635,11 +663,12 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
                             "unmatched_txns": len(txns)},
                 "mode": "agent", "error": "no_tool_skills_enabled"}
 
-    # Resolve effective temperature: explicit arg > config override > default.
+    # Resolve all per-tenant knobs once.
+    knobs = _resolve_knobs(platform_cfg)
+
+    # Effective temperature: explicit arg > config knob > default.
     if temperature is None:
-        cfg_temp = platform_cfg.get("agent_temperature")
-        temperature = (float(cfg_temp) if cfg_temp is not None
-                       else DEFAULT_AGENT_TEMPERATURE)
+        temperature = float(knobs.get("agent_temperature") or DEFAULT_AGENT_TEMPERATURE)
 
     used_ids: set[str] = set()
     matches: list[dict] = []
@@ -684,7 +713,7 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
         )
         decision = _run_one_proof(proof, candidates, bank, sid, pi,
                                   platform_cfg, tool_skills,
-                                  temperature=temperature)
+                                  temperature=temperature, knobs=knobs)
 
         d = decision.get("decision")
         ti = decision.get("txn_index")
@@ -712,14 +741,13 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
 
         # F2: second-pass verifier ensemble.
         # Pass 1 — deterministic skeptic (5 rules, free).
-        det_verifier = _verify_decision(decision, proof, chosen, bank)
+        det_verifier = _verify_decision(decision, proof, chosen, bank, knobs=knobs)
         # Pass 2 — LLM auditor (independent prompt, separate model call).
-        # Skipped when disabled by config, or when not a strict decision.
-        llm_enabled = bool(platform_cfg.get("verifier_llm_enabled", True))
+        llm_enabled = bool(knobs.get("verifier_llm_enabled", True))
         if llm_enabled and d == "strict" and chosen is not None:
             llm_verifier = _verifier_mod.llm_verify(
                 decision, proof, chosen, bank,
-                model_profile=platform_cfg.get("verifier_model_profile", "cheap"),
+                model_profile=knobs.get("verifier_model_profile", "cheap"),
                 temperature=0.0,
             )
         else:

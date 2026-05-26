@@ -15,13 +15,16 @@ export default function Settings() {
   const [drafts, setDrafts] = useState({});
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState("all"); // all | enabled | disabled | customized
+  const [knobs, setKnobs] = useState(null);  // {defaults, current, default_base_prompt}
+  const [knobDrafts, setKnobDrafts] = useState({});
 
   async function load() {
     setBusy(true);
     try {
-      const [r, pr] = await Promise.all([
+      const [r, pr, kr] = await Promise.all([
         fetch(`${API}/platform/skills`),
         fetch(`${API}/platform/model-profiles`).catch(() => null),
+        fetch(`${API}/platform/agent-knobs`).catch(() => null),
       ]);
       const j = await r.json();
       setSkills(j.skills || []);
@@ -31,11 +34,45 @@ export default function Settings() {
       (j.skills || []).forEach((s) => (next[s.id] = s.system_prompt));
       setDrafts(next);
       if (pr) setProfiles((await pr.json()).profiles || {});
+      if (kr) {
+        const k = await kr.json();
+        setKnobs(k);
+        setKnobDrafts({ ...k.defaults, ...k.current });
+      }
     } catch (e) {
       pushToast({ kind: "error", title: "Failed to load settings",
                   message: String(e?.message || e) });
     }
     setBusy(false);
+  }
+
+  async function saveKnobs() {
+    try {
+      const r = await fetch(`${API}/platform/agent-knobs`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(knobDrafts),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      await load();
+      pushToast({ kind: "ok", title: "Agent knobs saved",
+                  message: "Changes take effect on the next reconcile." });
+    } catch (e) {
+      pushToast({ kind: "error", title: "Save failed",
+                  message: String(e?.message || e) });
+    }
+  }
+
+  async function resetKnobs() {
+    if (!confirm("Reset every agent knob and base prompt to defaults?")) return;
+    try {
+      await fetch(`${API}/platform/agent-knobs/reset`, { method: "POST" });
+      await load();
+      pushToast({ kind: "ok", title: "Knobs reset" });
+    } catch (e) {
+      pushToast({ kind: "error", title: "Reset failed",
+                  message: String(e?.message || e) });
+    }
   }
 
   useEffect(() => { load(); }, []);
@@ -208,6 +245,106 @@ export default function Settings() {
           </div>
         )}
       </Card>
+
+      {/* Agent knobs */}
+      {knobs && (
+        <Card
+          title="🎛 Agent knobs"
+          subtitle="Per-tenant overrides for the agent loop, reflection, verifier, and base prompt. Empty = use built-in default."
+          actions={
+            <button onClick={resetKnobs}
+              className="text-xs px-3 py-1 rounded border border-slate-300 hover:bg-slate-50">
+              Reset all
+            </button>
+          }
+        >
+          <div className="grid md:grid-cols-2 gap-3 text-sm">
+            {[
+              ["max_steps", "Max tool-loop steps", "int", "How many LLM↔tool cycles per proof before fallback."],
+              ["match_tolerance", "Match tolerance", "pct", "Strict-match upper bound on diff % (after FX + fee)."],
+              ["date_window_days", "Date window (days)", "int", "Candidate txns must be within ±N days of the proof."],
+              ["agent_temperature", "Agent temperature", "float", "0 = deterministic. Eval forces 0 separately."],
+              ["reflection_max_cycles", "Reflection cycles", "int", "How many re-plan loops the agent gets per proof."],
+              ["reflection_confidence_threshold", "Reflection conf. threshold", "float", "Below this confidence, reflection nudges recall_facts."],
+              ["verifier_strict_diff_pct", "Verifier diff ceiling", "pct", "Tighter than match_tolerance — strict must beat this."],
+              ["verifier_strict_days_off", "Verifier max days off", "int", "Date gap above this auto-downgrades strict to soft."],
+              ["verifier_min_tool_calls_for_strict", "Verifier min tool calls", "int", "Strict claim needs ≥N substantive tool calls."],
+              ["verifier_llm_enabled", "LLM verifier enabled", "bool", "Enables the second-pass independent auditor."],
+              ["verifier_model_profile", "Verifier model profile", "profile", "Which model profile the LLM verifier uses."],
+            ].map(([key, label, type, hint]) => {
+              const val = knobDrafts[key];
+              const defaultVal = knobs.defaults[key];
+              const isOverridden = (knobs.current || {})[key] !== undefined;
+              const onChange = (v) => setKnobDrafts((d) => ({ ...d, [key]: v }));
+              return (
+                <div key={key} className={`border rounded-lg p-3 ${isOverridden ? "border-amber-300 bg-amber-50" : "border-slate-200"}`}>
+                  <div className="flex justify-between items-center gap-2">
+                    <label className="font-medium text-slate-800 text-xs">
+                      {label}
+                      {isOverridden && <Badge color="amber">overridden</Badge>}
+                    </label>
+                    {type === "bool" ? (
+                      <input type="checkbox" checked={Boolean(val)}
+                             onChange={(e) => onChange(e.target.checked)}
+                             className="w-4 h-4" />
+                    ) : type === "profile" ? (
+                      <select value={val || "cheap"} onChange={(e) => onChange(e.target.value)}
+                              className="text-xs border border-slate-300 rounded px-2 py-1 bg-white">
+                        {Object.keys(profiles).length > 0
+                          ? Object.keys(profiles).map((p) => <option key={p} value={p}>{p}</option>)
+                          : ["default", "cheap", "strong"].map((p) => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                    ) : (
+                      <input type="number"
+                             step={type === "float" || type === "pct" ? "0.01" : "1"}
+                             value={val ?? ""}
+                             onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))}
+                             className="text-xs border border-slate-300 rounded px-2 py-1 w-24 text-right bg-white" />
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-1">{hint}</div>
+                  <div className="text-[10px] text-slate-400 mt-0.5 font-mono">
+                    default: {String(defaultVal)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Base prompt — own card-within-card because it needs a textarea */}
+          <div className={`mt-4 border rounded-lg p-3 ${(knobs.current || {}).base_prompt ? "border-amber-300 bg-amber-50" : "border-slate-200"}`}>
+            <div className="flex justify-between items-center gap-2 mb-1">
+              <div>
+                <label className="font-medium text-slate-800 text-sm">
+                  🪄 Base agent prompt
+                  {(knobs.current || {}).base_prompt && <Badge color="amber">customized</Badge>}
+                </label>
+                <div className="text-[11px] text-slate-500">
+                  The highest-leverage prompt in the system. Leave empty to use the built-in.
+                </div>
+              </div>
+              <button onClick={() => setKnobDrafts((d) => ({ ...d, base_prompt: knobs.default_base_prompt }))}
+                      className="text-[11px] text-indigo-700 hover:underline">
+                ↺ load default
+              </button>
+            </div>
+            <textarea
+              value={knobDrafts.base_prompt ?? ""}
+              onChange={(e) => setKnobDrafts((d) => ({ ...d, base_prompt: e.target.value }))}
+              rows={8}
+              placeholder="(empty — uses built-in)"
+              className="w-full border border-slate-300 rounded p-2 text-[11px] font-mono bg-white"
+            />
+          </div>
+
+          <div className="mt-3 flex gap-2 justify-end">
+            <button onClick={saveKnobs}
+                    className="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 text-sm font-medium">
+              Save knobs
+            </button>
+          </div>
+        </Card>
+      )}
 
       {/* Skills */}
       <Card
