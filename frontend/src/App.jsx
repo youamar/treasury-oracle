@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import MagneticMatches from "./MagneticMatches.jsx";
 import SwiftRoute from "./SwiftRoute.jsx";
 import DunningModal from "./DunningModal.jsx";
@@ -15,6 +15,8 @@ import MemoryPanel from "./MemoryPanel.jsx";
 import EvalPanel from "./EvalPanel.jsx";
 import { apiFetch as fetch, pushToast } from "./Toast.jsx";
 import { SAMPLE_PROOFS, SAMPLE_TXNS, SAMPLE_PARSE_INFO } from "./sampleData.js";
+import Account, { getTenant, getEmail, isOnboarded, signOut, onAccountChange } from "./Account.jsx";
+import Onboarding from "./Onboarding.jsx";
 
 const API = "/api";
 
@@ -40,6 +42,39 @@ function Pill({ children, color = "slate" }) {
   };
   return <span className={`px-2 py-0.5 rounded text-xs font-medium ${map[color]}`}>{children}</span>;
 }
+
+/** Small avatar + email + dropdown for sign-out in the header. */
+function AccountBadge() {
+  const [open, setOpen] = useState(false);
+  const email = getEmail() || "";
+  const tenant = getTenant() || "";
+  const initial = email ? email[0].toUpperCase() : "?";
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen((o) => !o)}
+              className="bg-white/10 hover:bg-white/20 rounded-lg px-2 py-1 flex items-center gap-2 transition">
+        <span className="bg-white text-indigo-700 w-7 h-7 rounded-full flex items-center justify-center font-bold text-sm">
+          {initial}
+        </span>
+        <span className="hidden sm:inline text-sm text-blue-100">{email}</span>
+        <span className="text-xs text-blue-200">▼</span>
+      </button>
+      {open && (
+        <div className="absolute right-0 mt-2 bg-white text-slate-900 rounded-lg shadow-xl min-w-[220px] py-1 text-sm z-50">
+          <div className="px-3 py-2 border-b border-slate-100">
+            <div className="font-medium truncate">{email}</div>
+            <div className="text-[11px] text-slate-500 font-mono truncate">tenant: {tenant}</div>
+          </div>
+          <button onClick={() => { setOpen(false); signOut(); }}
+            className="w-full text-left px-3 py-2 hover:bg-slate-100 text-red-600">
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 /** 3-step progress stepper showing where the user is in the flow. */
 function Stepper({ proofsCount, txnsCount, hasResult }) {
@@ -80,7 +115,26 @@ function Stepper({ proofsCount, txnsCount, hasResult }) {
   );
 }
 
+/** Top-level gate: not signed in → Account screen; signed in but not
+ *  onboarded → Onboarding wizard; otherwise → the existing workspace. */
 export default function App() {
+  const [tenant, setTenant] = useState(getTenant());
+  const [onboarded, setOnboarded] = useState(isOnboarded());
+
+  useEffect(() => {
+    return onAccountChange(() => {
+      setTenant(getTenant());
+      setOnboarded(isOnboarded());
+    });
+  }, []);
+
+  if (!tenant) return <Account onAuthed={setTenant} />;
+  if (!onboarded) return <Onboarding onDone={() => setOnboarded(true)} />;
+  return <Workspace />;
+}
+
+
+function Workspace() {
   const [proofFiles, setProofFiles] = useState([]);
   const [stmtFile, setStmtFile] = useState(null);
   const [proofs, setProofs] = useState([]);
@@ -284,21 +338,24 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <header className="bg-gradient-to-r from-blue-700 via-indigo-700 to-purple-700 dark:from-blue-900 dark:via-indigo-900 dark:to-purple-900 text-white px-6 py-5 shadow">
+      <header className="bg-gradient-to-r from-blue-700 via-indigo-700 to-purple-700 text-white px-6 py-5 shadow">
         <div className="flex items-start justify-between gap-4 flex-wrap">
           <div className="min-w-0">
-            <h1 className="text-2xl font-bold">🌍 Treasury Oracle <span className="text-blue-200 text-sm font-normal">— Skill Platform</span></h1>
+            <h1 className="text-2xl font-bold">🌍 Treasury Oracle</h1>
             <p className="text-blue-100 text-sm">
-              Composable treasury agent · Vision OCR · Fuzzy matching · SWIFT tracing · Multilingual dunning · Configurable per customer
+              Build your own treasury AI agent — Vision OCR · Tool-calling reconciliation · Provenance-tracked decisions · Multilingual dunning
             </p>
           </div>
-          <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
-            {[["recon","Reconcile"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
-              <button key={k} onClick={() => setView(k)}
-                className={`px-3 py-1 rounded transition ${view === k ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white hover:bg-white/10"}`}
-              >{l}</button>
-            ))}
-          </nav>
+          <div className="flex items-center gap-3">
+            <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
+              {[["recon","Reconcile"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
+                <button key={k} onClick={() => setView(k)}
+                  className={`px-3 py-1 rounded transition ${view === k ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white hover:bg-white/10"}`}
+                >{l}</button>
+              ))}
+            </nav>
+            <AccountBadge />
+          </div>
         </div>
       </header>
       {view === "settings" && <Settings />}

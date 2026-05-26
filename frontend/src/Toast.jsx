@@ -94,8 +94,17 @@ export function ToastProvider({ children, max = 4, ttlMs = 6000 }) {
   );
 }
 
-/** Wrap fetch — surface non-2xx responses + network errors as toasts. */
+/** Wrap fetch — surface non-2xx responses + network errors as toasts.
+ *  Also auto-attaches the active tenant id so backend memory + config are
+ *  scoped to the signed-in account. */
 export async function apiFetch(input, init = {}) {
+  const tenant = (typeof localStorage !== "undefined")
+    ? localStorage.getItem("to_tenant_id") : null;
+  if (tenant) {
+    const h = new Headers(init.headers || {});
+    if (!h.has("x-tenant-id")) h.set("x-tenant-id", tenant);
+    init = { ...init, headers: h };
+  }
   try {
     const r = await fetch(input, init);
     if (!r.ok) {
