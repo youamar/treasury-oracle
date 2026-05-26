@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import MagneticMatches from "./MagneticMatches.jsx";
 import SwiftRoute from "./SwiftRoute.jsx";
 import DunningModal from "./DunningModal.jsx";
@@ -39,21 +39,6 @@ function Pill({ children, color = "slate" }) {
     purple:"bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-200",
   };
   return <span className={`px-2 py-0.5 rounded text-xs font-medium ${map[color]}`}>{children}</span>;
-}
-
-/** Persistent dark-mode toggle. Reads/writes localStorage and toggles the
- *  `dark` class on <html> so every Tailwind `dark:` variant kicks in. */
-function useTheme() {
-  const [theme, setTheme] = useState(() => {
-    if (typeof window === "undefined") return "light";
-    return localStorage.getItem("theme") ||
-      (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  });
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", theme === "dark");
-    localStorage.setItem("theme", theme);
-  }, [theme]);
-  return [theme, () => setTheme(t => t === "dark" ? "light" : "dark")];
 }
 
 /** 3-step progress stepper showing where the user is in the flow. */
@@ -105,7 +90,6 @@ export default function App() {
   const [bank, setBank] = useState("Maybank");
   const [busy, setBusy] = useState("");
   const [liveTrace, setLiveTrace] = useState([]);  // streaming agent events while busy
-  const [theme, toggleTheme] = useTheme();
   const [toolsOpen, setToolsOpen] = useState(false);
   const [dunningTarget, setDunningTarget] = useState(null);
   const [view, setView] = useState("recon"); // "recon" | "settings" | "memory"
@@ -308,21 +292,13 @@ export default function App() {
               Composable treasury agent · Vision OCR · Fuzzy matching · SWIFT tracing · Multilingual dunning · Configurable per customer
             </p>
           </div>
-          <div className="flex items-center gap-3">
-            <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
-              {[["recon","Reconcile"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
-                <button key={k} onClick={() => setView(k)}
-                  className={`px-3 py-1 rounded transition ${view === k ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white hover:bg-white/10"}`}
-                >{l}</button>
-              ))}
-            </nav>
-            <button onClick={toggleTheme}
-                    title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-                    aria-label="Toggle dark mode"
-                    className="bg-white/10 hover:bg-white/20 rounded-lg w-8 h-8 flex items-center justify-center text-lg transition">
-              {theme === "dark" ? "☀️" : "🌙"}
-            </button>
-          </div>
+          <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
+            {[["recon","Reconcile"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
+              <button key={k} onClick={() => setView(k)}
+                className={`px-3 py-1 rounded transition ${view === k ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white hover:bg-white/10"}`}
+              >{l}</button>
+            ))}
+          </nav>
         </div>
       </header>
       {view === "settings" && <Settings />}
