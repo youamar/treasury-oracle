@@ -121,6 +121,24 @@ def _safe_inbox_path(filename: str) -> Path:
 def health(): return {"status": "ok"}
 
 
+# ---------- maintenance ----------
+
+@app.post("/api/maintenance/gc-uploads")
+def gc_uploads(older_than_days: int = Query(30, ge=1, le=3650),
+               keep_referenced: bool = Query(True)):
+    """Garbage-collect raw_uploads + their bytes on disk older than the
+    cutoff. Wire to a cron job in production. Returns a summary."""
+    return _uploads.gc_old_uploads(older_than_days=older_than_days,
+                                   keep_sessions=keep_referenced)
+
+
+@app.post("/api/maintenance/prune-idempotency")
+def prune_idempotency(older_than_seconds: int = Query(86400, ge=60)):
+    """Prune cached idempotency keys older than the TTL."""
+    deleted = db.prune_idempotency(older_than_seconds=older_than_seconds)
+    return {"rows_deleted": deleted}
+
+
 # ---------- bank registry (C-5 + C-7) ----------
 
 class BankBody(BaseModel):

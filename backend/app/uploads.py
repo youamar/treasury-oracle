@@ -77,3 +77,69 @@ def read_bytes(sha256: str) -> bytes | None:
         return None
     p = Path(rec["storage_path"])
     return p.read_bytes() if p.exists() else None
+
+
+# ---------- garbage collection (S-3) ----------
+
+import time as _time
+
+def gc_old_uploads(older_than_days: int = 30,
+                   keep_sessions: bool = True) -> dict:
+    """Delete raw_uploads rows older than the cutoff AND their bytes on disk.
+
+    `keep_sessions=True` preserves any upload still referenced by a
+    persisted session (the SHA is recorded in agent_trace + match
+    provenance). Without that anchor, the audit-pack source-bytes
+    verification would fail after GC.
+
+    Returns a summary dict; safe to call from a cron/maintenance endpoint.
+    """
+    cutoff_epoch = _time.time() - older_than_days * 86400
+    from datetime import datetime, timezone
+    cutoff_iso = datetime.fromtimestamp(cutoff_epoch, timezone.utc).isoformat(timespec="seconds")
+
+    deleted_rows = 0
+    deleted_bytes = 0
+    skipped_referenced = 0
+
+    with db.conn() as c:
+        # Find old rows. Multi-tenant safe: this is an unscoped maintenance
+        # operation; only the orchestrator should call it.
+        rows = c.execute(
+            "SELECT id, sha256, storage_path, size FROM raw_uploads "
+            "WHERE uploaded_at < ?",
+            (cutoff_iso,),
+        ).fetchall()
+
+        for r in rows:
+            if keep_sessions:
+                # Is any agent_trace / match still pointing at this SHA?
+                # Provenance carries it inside conversion_json; matches table
+                # also stores the proof_json with source_sha256.
+                referenced = c.execute(
+                    "SELECT 1 FROM matches "
+                    "WHERE proof_json LIKE ? OR conversion_json LIKE ? "
+                    "LIMIT 1",
+                    (f'%"{r["sha256"]}"%', f'%"{r["sha256"]}"%'),
+                ).fetchone()
+                if referenced:
+                    skipped_referenced += 1
+                    continue
+
+            # Drop the row + the bytes on disk.
+            c.execute("DELETE FROM raw_uploads WHERE id = ?", (r["id"],))
+            try:
+                p = Path(r["storage_path"])
+                if p.exists():
+                    deleted_bytes += p.stat().st_size
+                    p.unlink()
+            except Exception:
+                pass
+            deleted_rows += 1
+
+    return {
+        "cutoff": cutoff_iso,
+        "rows_deleted": deleted_rows,
+        "bytes_deleted": deleted_bytes,
+        "rows_skipped_still_referenced": skipped_referenced,
+    }

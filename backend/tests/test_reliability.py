@@ -266,3 +266,74 @@ def test_breaker_success_closes_after_recovery():
     rel._record_outcome("test.recover", ok=True)
     assert db.get_breaker_state("test.recover")["state"] == "closed"
     assert db.get_breaker_state("test.recover")["failures"] == 0
+
+
+def test_upload_gc_drops_old_bytes(tmp_path):
+    """S-3: gc_old_uploads removes both DB rows and storage bytes when an
+    upload is older than the cutoff AND not referenced by a match."""
+    from datetime import datetime, timezone, timedelta
+    import hashlib
+    from app import db, uploads
+    from pathlib import Path
+
+    payload = b"GC-TEST-bytes" + b"a" * 100
+    sha = hashlib.sha256(payload).hexdigest()
+    rec = uploads.store_bytes("gc.png", payload, purpose="proof")
+    # Hand-edit the row to look old.
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat(timespec="seconds")
+    with db.conn() as c:
+        c.execute("UPDATE raw_uploads SET uploaded_at = ? WHERE id = ?",
+                  (old_iso, rec["id"]))
+
+    assert Path(rec["storage_path"]).exists()
+
+    out = uploads.gc_old_uploads(older_than_days=30, keep_sessions=False)
+    assert out["rows_deleted"] >= 1
+    assert out["bytes_deleted"] >= len(payload)
+    assert not Path(rec["storage_path"]).exists()
+    assert db.find_upload_by_sha(sha) is None
+
+
+def test_upload_gc_keeps_referenced_uploads():
+    """When the SHA is still cited by a persisted match, GC must skip it."""
+    from datetime import datetime, timezone, timedelta
+    import hashlib, json
+    from app import db, uploads
+    from pathlib import Path
+
+    payload = b"GC-KEEP-bytes" + b"b" * 100
+    sha = hashlib.sha256(payload).hexdigest()
+    rec = uploads.store_bytes("keep.png", payload, purpose="proof")
+
+    # Plant a match row that references this SHA in its proof_json.
+    proof = {"amount": 1, "currency": "USD", "source_file": "keep.png",
+             "source_sha256": sha}
+    db.save_session("keep-sess", "Maybank", {
+        "summary": {"total_proofs": 1, "total_txns": 0, "matched": 1,
+                    "soft_matches": 0, "unmatched_proofs": 0,
+                    "unmatched_txns": 0},
+        "trace": [],
+        "matches": [{
+            "proof": proof,
+            "txn": {"id": "tx", "amount": 1, "currency": "USD",
+                    "description": "x", "reference": ""},
+            "conversion": {"fx_rate": 1, "expected_gross": 1, "expected_net": 1,
+                           "actual_received": 1, "fee_pct": 0, "fee_amount": 0,
+                           "provenance": {"proof_amount":
+                                          {"source_sha256": sha}}},
+            "confidence": 0.9, "reasoning": "x", "status": "matched",
+        }],
+        "soft_matches": [], "unmatched_proofs": [], "unmatched_txns": [],
+    })
+
+    # Age the upload.
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat(timespec="seconds")
+    with db.conn() as c:
+        c.execute("UPDATE raw_uploads SET uploaded_at = ? WHERE id = ?",
+                  (old_iso, rec["id"]))
+
+    out = uploads.gc_old_uploads(older_than_days=30, keep_sessions=True)
+    assert out["rows_skipped_still_referenced"] >= 1
+    # Bytes still on disk
+    assert Path(rec["storage_path"]).exists()
+    assert db.find_upload_by_sha(sha) is not None

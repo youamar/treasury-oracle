@@ -134,6 +134,14 @@ DATE_WINDOW_DAYS = 5
 DEFAULT_AGENT_TEMPERATURE = 0.1   # production default
 EVAL_AGENT_TEMPERATURE = 0.0      # used during eval runs for reproducibility
 
+# Backpressure — bound how many LLM calls the agent is making in flight at
+# once. Without this, N concurrent /api/reconcile requests fan out to
+# N × proofs × MAX_STEPS concurrent Chutes calls and trip rate limits.
+import threading as _threading
+import os as _os
+AGENT_LLM_CONCURRENCY = int(_os.getenv("AGENT_LLM_CONCURRENCY", "4"))
+_agent_llm_semaphore = _threading.BoundedSemaphore(AGENT_LLM_CONCURRENCY)
+
 # Reflection — when the agent's first decision is shaky, we let it re-plan
 # once. Triggers below cover the patterns we've actually seen in eval runs.
 REFLECTION_CONFIDENCE_THRESHOLD = 0.7
@@ -521,18 +529,19 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
         step += 1
         t0 = time.perf_counter()
         try:
-            resp = reliability.with_retry(
-                lambda: client.chat.completions.create(
-                    model=REASONING_MODEL,
-                    messages=messages,
-                    tools=tool_specs,
-                    tool_choice="auto",
-                    temperature=temperature,
-                    max_tokens=900,
-                    timeout=30,
-                ),
-                source="agent.run_one_proof",
-            )
+            with _agent_llm_semaphore:
+                resp = reliability.with_retry(
+                    lambda: client.chat.completions.create(
+                        model=REASONING_MODEL,
+                        messages=messages,
+                        tools=tool_specs,
+                        tool_choice="auto",
+                        temperature=temperature,
+                        max_tokens=900,
+                        timeout=30,
+                    ),
+                    source="agent.run_one_proof",
+                )
         except Exception as e:
             latency = (time.perf_counter() - t0) * 1000
             db.append_trace(session_id, proof.get("source_file"), step, "error",
