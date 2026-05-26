@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { apiFetch as fetch } from "./Toast.jsx";
+import { apiFetch as fetch, pushToast } from "./Toast.jsx";
 
 export default function DunningModal({ proof, expected, actual, localCcy, onClose }) {
   const [email, setEmail] = useState(null);
@@ -8,22 +8,58 @@ export default function DunningModal({ proof, expected, actual, localCcy, onClos
 
   async function draft() {
     setLoading(true);
-    const shortfall = +(proof.amount * (1 - actual / expected)).toFixed(2);
-    const r = await fetch("/api/dunning", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_name: proof.payer || "Valued Client",
-        invoice_ref: proof.reference || "",
-        invoice_amount: proof.amount,
-        invoice_ccy: proof.currency,
-        received_local: actual,
-        local_ccy: localCcy,
-        shortfall_invoice: shortfall,
-      }),
-    });
-    setEmail(await r.json());
-    setLoading(false);
+    try {
+      // Guard against NaN — agent 'no_match' discrepancies often have null
+      // expected_net / actual, in which case the dunning is about the
+      // *whole* invoice rather than a percentage shortfall.
+      let shortfall = 0;
+      const exp = Number(expected), act = Number(actual), amt = Number(proof.amount);
+      if (isFinite(exp) && isFinite(act) && exp > 0 && isFinite(amt)) {
+        shortfall = +(amt * (1 - act / exp)).toFixed(2);
+      } else if (isFinite(amt)) {
+        shortfall = amt;  // nothing landed — full invoice is outstanding
+      }
+
+      const r = await fetch("/api/dunning", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: proof.payer || "Valued Client",
+          invoice_ref: proof.reference || "",
+          invoice_amount: isFinite(amt) ? amt : 0,
+          invoice_ccy: proof.currency || "USD",
+          received_local: isFinite(act) ? act : 0,
+          local_ccy: localCcy || "MYR",
+          shortfall_invoice: shortfall,
+        }),
+      });
+      if (!r.ok) {
+        const detail = await r.text();
+        throw new Error(`${r.status}: ${detail.slice(0, 200)}`);
+      }
+      const j = await r.json();
+      // Backend may return a fallback email with `error` set as metadata —
+      // still show it, just warn the user it's the offline template.
+      if (j.body && j.subject) {
+        setEmail(j);
+        if (j.fallback) {
+          pushToast({
+            kind: "warn", title: "Used offline template",
+            message: "LLM unavailable; showing canned dunning copy.",
+          });
+        }
+      } else {
+        throw new Error(j.error || "no email body returned");
+      }
+    } catch (e) {
+      pushToast({
+        kind: "error",
+        title: "Dunning draft failed",
+        message: String(e?.message || e),
+      });
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -39,7 +75,7 @@ export default function DunningModal({ proof, expected, actual, localCcy, onClos
 
         {!email ? (
           <button onClick={draft} disabled={loading}
-                  className="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700">
+                  className="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed">
             {loading ? "Drafting in payer's language..." : "✍️ Draft email with AI"}
           </button>
         ) : (
