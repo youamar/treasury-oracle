@@ -359,7 +359,7 @@ function Workspace() {
         </div>
       </header>
       {view === "settings" && <Settings />}
-      {view === "memory" && <main className="max-w-6xl mx-auto p-6"><MemoryPanel /></main>}
+      {view === "memory" && <MemoryPanel />}
       {view === "eval" && <EvalPanel />}
       {(view !== "recon") ? null : (
 
