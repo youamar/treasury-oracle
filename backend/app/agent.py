@@ -134,6 +134,13 @@ DATE_WINDOW_DAYS = 5
 DEFAULT_AGENT_TEMPERATURE = 0.1   # production default
 EVAL_AGENT_TEMPERATURE = 0.0      # used during eval runs for reproducibility
 
+# Reflection — when the agent's first decision is shaky, we let it re-plan
+# once. Triggers below cover the patterns we've actually seen in eval runs:
+# low confidence claims, soft/discrepancy without the relevant tool calls,
+# strict claims without any FX lookup.
+REFLECTION_CONFIDENCE_THRESHOLD = 0.7
+REFLECTION_MAX_CYCLES = 1  # cap so a confused LLM can't burn the step budget
+
 # Verifier (F2) — second-pass skeptic that audits the agent's proposed decision.
 # Currently deterministic (free, zero extra tokens); an LLM-backed verifier can
 # be plugged into the same hook later.
@@ -374,6 +381,65 @@ def _dispatch_skill(skill_id: str, args: dict, ctx: SkillContext) -> Any:
 
 # ---------- The agent loop ----------
 
+def _should_reflect(decision: dict, tool_calls_made: list[dict],
+                    enabled_skill_ids: set[str]) -> tuple[bool, str]:
+    """Decide whether the agent's first decision warrants a re-plan pass.
+
+    Returns (do_reflect, nudge_message). The nudge is appended as a user
+    message so the agent re-enters its tool loop with concrete guidance
+    about *what* it might have missed.
+    """
+    d = decision.get("decision")
+    conf = float(decision.get("confidence") or 0)
+    tools_used = {tc.get("name") for tc in tool_calls_made}
+
+    # Soft / discrepancy without calling fuzzy_compare — we're asserting
+    # similarity without checking it. Common LLM shortcut.
+    if d in ("soft", "discrepancy") and "fuzzy_compare" in enabled_skill_ids \
+            and "fuzzy_compare" not in tools_used:
+        return True, (
+            "You decided '" + d + "' without calling fuzzy_compare to verify "
+            "name/reference similarity. Run fuzzy_compare on (proof.payer, "
+            "txn.description) and (proof.reference, txn.reference|description), "
+            "then re-decide. If your prior answer still holds, return the same "
+            "JSON; otherwise update it."
+        )
+
+    # Strict without any FX call. Likely hallucinated rate.
+    if d == "strict" and "get_fx_rate" in enabled_skill_ids \
+            and "get_fx_rate" not in tools_used:
+        return True, (
+            "You returned 'strict' without calling get_fx_rate. Treasury "
+            "Oracle policy: strict matches must be grounded in a live FX "
+            "lookup. Call get_fx_rate(from_ccy, to_ccy, proof.date), then "
+            "re-evaluate whether the converted amount really lines up."
+        )
+
+    # Discrepancy where SWIFT routing could explain the gap — try it.
+    if d == "discrepancy" and "trace_swift_route" in enabled_skill_ids \
+            and "trace_swift_route" not in tools_used:
+        return True, (
+            "You flagged this as a discrepancy but didn't call "
+            "trace_swift_route. Call it now — if the gap is consistent with "
+            "1–2 correspondent banks' standard fees, it may not be a "
+            "discrepancy at all. Update your decision accordingly."
+        )
+
+    # Low confidence on ANY decision — invite recall_facts to surface
+    # previously-learned patterns about this payer / currency pair.
+    if conf < REFLECTION_CONFIDENCE_THRESHOLD and \
+            "recall_facts" in enabled_skill_ids and \
+            "recall_facts" not in tools_used:
+        return True, (
+            f"Your confidence ({conf:.2f}) is below the {REFLECTION_CONFIDENCE_THRESHOLD} "
+            "reflection threshold. Call recall_facts on the payer name and "
+            "the currency pair to surface anything the platform has learned "
+            "from previous runs, then re-decide."
+        )
+
+    return False, ""
+
+
 def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
                    session_id: str, proof_idx: int,
                    platform_cfg: dict, tool_skills: list,
@@ -393,6 +459,9 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
     client = get_client(False)
     step = 0
     tool_call_log: list[dict] = []
+    reflection_cycles = 0
+    reflection_history: list[dict] = []  # each entry: {step, trigger, prior_decision}
+    enabled_skill_ids = {s.id for s in tool_skills}
 
     for _ in range(MAX_STEPS):
         step += 1
@@ -487,7 +556,36 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
         if final is not None:
             db.append_trace(session_id, proof.get("source_file"), step,
                             "decision", final)
+            # Reflection — give the agent one shot to reconsider when its
+            # initial decision shows red flags (low confidence, missing
+            # critical tool calls). Bounded by REFLECTION_MAX_CYCLES so we
+            # can't burn the whole step budget on second-guessing.
+            if reflection_cycles < REFLECTION_MAX_CYCLES:
+                should, nudge = _should_reflect(final, tool_call_log, enabled_skill_ids)
+                if should:
+                    reflection_cycles += 1
+                    reflection_history.append({
+                        "step": step,
+                        "trigger": nudge[:120],
+                        "prior_decision": final.get("decision"),
+                        "prior_confidence": final.get("confidence"),
+                    })
+                    db.append_trace(session_id, proof.get("source_file"), step,
+                                    "reflection", {
+                                        "cycle": reflection_cycles,
+                                        "prior_decision": final.get("decision"),
+                                        "prior_confidence": final.get("confidence"),
+                                        "nudge": nudge[:200],
+                                    })
+                    # Inject the assistant's prior answer back into history so
+                    # the LLM sees its own claim, then nudge as a user message.
+                    messages.append({"role": "assistant",
+                                     "content": json.dumps(final)})
+                    messages.append({"role": "user", "content": nudge})
+                    continue
             final["tool_calls"] = tool_call_log
+            if reflection_history:
+                final["reflection_history"] = reflection_history
             return final
         db.append_trace(session_id, proof.get("source_file"), step, "parse_error",
                         {"raw": (msg.content or "")[:500]})

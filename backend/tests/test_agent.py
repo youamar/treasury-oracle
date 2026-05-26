@@ -21,7 +21,11 @@ def _make_client(script):
             class completions:
                 @staticmethod
                 def create(**kw):
-                    s = script[state["i"]]
+                    # Repeat last response if script exhausted (lets the agent
+                    # reflection loop see the same answer instead of crashing
+                    # when a test didn't anticipate the extra turn).
+                    idx = min(state["i"], len(script) - 1)
+                    s = script[idx]
                     state["i"] += 1
                     if "tool_calls" in s:
                         tcs = [SimpleNamespace(
@@ -500,3 +504,78 @@ def test_llm_verifier_skipped_when_disabled(sample_proof, sample_txn, monkeypatc
     v = out["matches"][0]["conversion"]["provenance"]["verifier"]
     assert v["ensemble"] == "deterministic_only"
     assert v["llm_verifier"]["ran"] is False
+
+
+def test_reflection_triggers_on_strict_without_fx(sample_proof, sample_txn, monkeypatch):
+    """Agent claims strict without calling get_fx_rate — reflection nudge
+    forces a second pass. The final decision carries reflection_history."""
+    import json
+    from app import agent as agent_mod
+
+    # The mock client tracks how many times create() has been called and
+    # returns scripted responses in order.
+    txn = {**sample_txn, "description": "INWARD TT ACME CORP INV-2026-001",
+           "reference": "INV-2026-001"}
+    expected_net = round(1000 * 4.72 * 0.995, 2)
+
+    # Step 1: agent jumps straight to strict with no tools.
+    # Step 2: after reflection nudge, agent calls get_fx_rate.
+    # Step 3: re-decision still strict but now with the tool call recorded.
+    script = [
+        {"content": json.dumps({
+            "decision": "strict", "txn_index": 0,
+            "fx_rate": 4.72, "fee_amount": 23.6,
+            "expected_net": expected_net, "actual": txn["amount"],
+            "confidence": 0.98, "fuzzy_signals": [], "swift_route": None,
+            "reasoning": "Looks right.",
+        })},
+        {"tool_calls": [{"name": "get_fx_rate",
+                         "arguments": {"from_ccy": "USD", "to_ccy": "MYR",
+                                       "date": "2026-05-20"}}]},
+        {"content": json.dumps({
+            "decision": "strict", "txn_index": 0,
+            "fx_rate": 4.72, "fee_amount": 23.6,
+            "expected_net": expected_net, "actual": txn["amount"],
+            "confidence": 0.99, "fuzzy_signals": [], "swift_route": None,
+            "reasoning": "Within tolerance after fees, FX confirmed.",
+        })},
+    ]
+    monkeypatch.setattr(agent_mod, "get_client",
+                        lambda use_fallback=False: _make_client(script))
+
+    out = agent_mod.reconcile_agent([sample_proof], [txn], "Maybank")
+    assert out["summary"]["matched"] == 1
+    m = out["matches"][0]
+    # The reflection cycle should have run and be recorded on the decision.
+    rh = m.get("agent_tool_calls") or []
+    # Tool calls log should contain get_fx_rate now (the reflection nudged it).
+    assert any(tc.get("name") == "get_fx_rate" for tc in rh)
+
+
+def test_reflection_does_not_loop_unbounded(sample_proof, sample_txn, monkeypatch):
+    """REFLECTION_MAX_CYCLES caps how many times we re-prompt. After the cap,
+    the agent's answer is accepted as-is even if still 'shaky'."""
+    import json
+    from app import agent as agent_mod
+
+    # All responses are strict-without-fx; if reflection looped unbounded,
+    # the agent would spin forever. We expect at most one reflection cycle.
+    bad_response = {
+        "content": json.dumps({
+            "decision": "strict", "txn_index": 0,
+            "fx_rate": 4.72, "fee_amount": 23.6,
+            "expected_net": 4696.40, "actual": sample_txn["amount"],
+            "confidence": 0.98, "fuzzy_signals": [], "swift_route": None,
+            "reasoning": "Confident.",
+        })
+    }
+    monkeypatch.setattr(agent_mod, "get_client",
+                        lambda use_fallback=False: _make_client(
+                            [bad_response, bad_response, bad_response, bad_response]))
+
+    txn = {**sample_txn, "description": "INWARD TT ACME CORP INV-2026-001",
+           "reference": "INV-2026-001"}
+    out = agent_mod.reconcile_agent([sample_proof], [txn], "Maybank")
+    # Must finish, not hang or exhaust step budget into a no_match fallback.
+    summary = out["summary"]
+    assert summary["matched"] + summary["soft_matches"] == 1

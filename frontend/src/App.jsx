@@ -657,6 +657,7 @@ function Workspace() {
                               : t.type === "error" ? "text-red-300"
                               : t.type === "verifier_downgrade" ? "text-amber-300"
                               : t.type === "verifier_confirm" ? "text-emerald-300"
+                              : t.type === "reflection" ? "text-purple-300"
                               : "text-slate-300";
                     const label = t.type === "tool_call"
                       ? `→ ${t.payload?.name}(${JSON.stringify(t.payload?.arguments || {}).slice(0, 60)})`
@@ -668,6 +669,8 @@ function Workspace() {
                       ? `⚠ verifier: ${(t.payload?.concerns || []).join("; ")}`
                       : t.type === "verifier_confirm"
                       ? `✓ verifier confirmed`
+                      : t.type === "reflection"
+                      ? `↻ re-plan cycle ${t.payload?.cycle}: ${t.payload?.nudge?.slice(0, 80)}`
                       : t.type;
                     return (
                       <div key={`${t.step}-${i}`} className={color}>
