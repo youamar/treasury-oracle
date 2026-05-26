@@ -5,6 +5,142 @@ import Page, { Card, Badge, EmptyState } from "./Page.jsx";
 const API = "/api";
 
 
+function BanksEditor() {
+  const [banks, setBanks] = useState([]);
+  const [draftRow, setDraftRow] = useState(null);
+
+  async function load() {
+    const r = await fetch(`${API}/banks`);
+    if (!r.ok) return;
+    setBanks((await r.json()).banks || []);
+  }
+  useEffect(() => { load(); }, []);
+
+  async function save(b) {
+    try {
+      const r = await fetch(`${API}/banks/${encodeURIComponent(b.id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(b),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      await load();
+      setDraftRow(null);
+      pushToast({ kind: "ok", title: "Bank saved", message: b.name || b.id });
+    } catch (e) {
+      pushToast({ kind: "error", title: "Save failed", message: String(e?.message || e) });
+    }
+  }
+
+  async function del(id) {
+    if (!confirm(`Delete bank "${id}"?`)) return;
+    await fetch(`${API}/banks/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await load();
+    pushToast({ kind: "ok", title: "Bank deleted" });
+  }
+
+  return (
+    <Card
+      title="🏦 Banks"
+      subtitle="Customer-editable bank registry. Each row drives the bank dropdown, the inbound-fee math, and optional per-bank match tolerance."
+      actions={
+        <button onClick={() => setDraftRow({ id: "", name: "", inbound_fee_pct: 0.005,
+                                             match_tolerance: null, currency: "MYR",
+                                             swift_bic: "", notes: "" })}
+                className="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">
+          + New bank
+        </button>
+      }
+    >
+      <div className="overflow-x-auto -mx-5 px-5">
+        <table className="w-full text-sm">
+          <thead className="text-xs uppercase text-slate-500">
+            <tr>
+              <th className="text-left py-1">ID</th>
+              <th className="text-left">Name</th>
+              <th className="text-right">Fee %</th>
+              <th className="text-right">Match tol.</th>
+              <th className="text-left">Currency</th>
+              <th className="text-left">BIC</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {banks.map((b) => (
+              <tr key={b.id} className="border-t border-slate-100">
+                <td className="py-2 font-mono text-xs">{b.id}</td>
+                <td className="py-2">{b.name}</td>
+                <td className="py-2 text-right tabular-nums">{(b.inbound_fee_pct * 100).toFixed(2)}%</td>
+                <td className="py-2 text-right tabular-nums text-slate-500">
+                  {b.match_tolerance != null ? `${(b.match_tolerance*100).toFixed(2)}%` : "—"}
+                </td>
+                <td className="py-2 text-xs">{b.currency || "—"}</td>
+                <td className="py-2 font-mono text-[10px]">{b.swift_bic || "—"}</td>
+                <td className="text-right py-2 space-x-2">
+                  <button onClick={() => setDraftRow({ ...b })}
+                          className="text-xs text-indigo-700 hover:underline">edit</button>
+                  <button onClick={() => del(b.id)}
+                          className="text-xs text-red-600 hover:underline">delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {draftRow && (
+        <div className="mt-4 border-2 border-indigo-300 bg-indigo-50 rounded-lg p-3">
+          <div className="font-medium text-sm mb-2">
+            {banks.find(x => x.id === draftRow.id) ? "Edit" : "New"} bank
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2 text-sm">
+            {[
+              ["id", "ID (slug)", "text"],
+              ["name", "Display name", "text"],
+              ["inbound_fee_pct", "Fee % (0.005 = 0.5%)", "number"],
+              ["match_tolerance", "Match tolerance (override)", "number"],
+              ["currency", "Currency", "text"],
+              ["swift_bic", "SWIFT BIC", "text"],
+            ].map(([k, label, type]) => (
+              <label key={k} className="block">
+                <span className="text-[11px] text-slate-600">{label}</span>
+                <input type={type} step={type === "number" ? "0.001" : undefined}
+                       value={draftRow[k] ?? ""}
+                       onChange={(e) => setDraftRow({
+                         ...draftRow,
+                         [k]: type === "number"
+                           ? (e.target.value === "" ? null : Number(e.target.value))
+                           : e.target.value,
+                       })}
+                       className="mt-0.5 w-full border border-slate-300 rounded px-2 py-1 text-sm bg-white" />
+              </label>
+            ))}
+          </div>
+          <textarea
+            value={draftRow.notes || ""}
+            onChange={(e) => setDraftRow({ ...draftRow, notes: e.target.value })}
+            placeholder="optional notes (e.g. 'check inbound fee schedule quarterly')"
+            rows={2}
+            className="mt-2 w-full border border-slate-300 rounded p-2 text-xs"
+          />
+          <div className="mt-2 flex gap-2 justify-end">
+            <button onClick={() => setDraftRow(null)}
+                    className="px-3 py-1 rounded border border-slate-300 text-sm hover:bg-slate-100">
+              Cancel
+            </button>
+            <button onClick={() => save(draftRow)}
+                    disabled={!draftRow.id || !(draftRow.inbound_fee_pct >= 0)}
+                    className="px-3 py-1 rounded bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-50">
+              Save bank
+            </button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+
 export default function Settings() {
   const [skills, setSkills] = useState([]);
   const [config, setConfig] = useState(null);
@@ -446,6 +582,9 @@ export default function Settings() {
           ))
         )}
       </Card>
+
+      {/* Banks */}
+      <BanksEditor />
 
       {/* Raw config (hidden by default) */}
       {config && (

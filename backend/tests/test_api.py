@@ -220,3 +220,41 @@ def test_rate_limit_scoped_per_tenant():
     r2 = client.post("/api/eval/run", json={},
                      headers={"x-tenant-id": "tenant-b"})
     assert r2.status_code == 200
+
+
+def test_banks_seeded_per_tenant_and_editable():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+    # Fresh tenant gets the historical BANK_FEES seed.
+    r = client.get("/api/banks", headers={"x-tenant-id": "banks-test"})
+    assert r.status_code == 200
+    banks = r.json()["banks"]
+    ids = {b["id"] for b in banks}
+    assert {"Maybank", "CIMB", "default"} <= ids
+    maybank = next(b for b in banks if b["id"] == "Maybank")
+    assert maybank["inbound_fee_pct"] == 0.005
+
+    # Edit Maybank's fee — should round-trip.
+    r2 = client.put("/api/banks/Maybank",
+                    json={"id": "Maybank", "name": "Maybank (custom)",
+                          "inbound_fee_pct": 0.006},
+                    headers={"x-tenant-id": "banks-test"})
+    assert r2.status_code == 200
+    assert r2.json()["inbound_fee_pct"] == 0.006
+
+    # Other tenants don't see the edit.
+    r3 = client.get("/api/banks", headers={"x-tenant-id": "banks-other"})
+    other = next(b for b in r3.json()["banks"] if b["id"] == "Maybank")
+    assert other["inbound_fee_pct"] == 0.005
+
+
+def test_apply_bank_fee_reads_from_db():
+    """tools.apply_bank_fee uses the per-tenant DB value when available."""
+    from app import db, tools
+    with db.tenant_scope("fee-db-test"):
+        db.upsert_bank({"id": "MyBank", "name": "MyBank",
+                        "inbound_fee_pct": 0.012})
+        result = tools.apply_bank_fee(1000.0, "MyBank")
+        assert result["fee_pct"] == 0.012
+        assert result["source"].startswith("db:banks/")

@@ -122,14 +122,33 @@ get_fx_rate.cache_clear = _fx_lookup_cached.cache_clear  # type: ignore[attr-def
 
 
 def apply_bank_fee(amount: float, bank_name: str = "default") -> dict:
-    """Returns {fee_pct, fee_amount, net_amount}."""
-    pct = BANK_FEES.get(bank_name, BANK_FEES["default"])
+    """Returns {fee_pct, fee_amount, net_amount, source}.
+
+    Looks up the per-tenant banks table first; falls back to the in-code
+    BANK_FEES dict if the DB is unreachable or the tenant has no row yet.
+    `source` tags which path was taken so the agent's provenance block
+    can record it.
+    """
+    pct = None
+    source = "config:BANK_FEES"
+    try:
+        from . import db as _db
+        row = _db.get_bank(bank_name)
+        if row and row.get("inbound_fee_pct") is not None:
+            pct = float(row["inbound_fee_pct"])
+            source = f"db:banks/{bank_name}"
+    except Exception:
+        # DB lookup failed (early-boot, missing tenant ctx, etc.) — use code defaults.
+        pass
+    if pct is None:
+        pct = BANK_FEES.get(bank_name, BANK_FEES["default"])
     fee = round(amount * pct, 2)
     return {
         "bank": bank_name,
         "fee_pct": pct,
         "fee_amount": fee,
         "net_amount": round(amount - fee, 2),
+        "source": source,
     }
 
 

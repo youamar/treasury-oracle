@@ -305,6 +305,22 @@ CREATE TABLE IF NOT EXISTS calibrators (
     UNIQUE (tenant_id, scope)
 );
 
+CREATE TABLE IF NOT EXISTS banks (
+    -- Per-tenant bank registry. Pre-seeded with the historical BANK_FEES
+    -- dict on first boot per tenant; customers can edit / add / delete.
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    id TEXT NOT NULL,                  -- slug used as the public 'bank' field
+    name TEXT NOT NULL,                -- human label for dropdowns
+    inbound_fee_pct REAL NOT NULL,     -- fee on inbound FX conversions
+    match_tolerance REAL,              -- per-bank override of global tolerance
+    currency TEXT,                     -- primary settlement currency (informational)
+    swift_bic TEXT,                    -- optional BIC for SWIFT route inference
+    notes TEXT,                        -- free-form operator notes
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+
 CREATE TABLE IF NOT EXISTS tenant_notes (
     -- A free-form markdown 'knowledge file' per tenant. Read by the agent
     -- on every reconciliation, editable from the Memory page. Think of it
@@ -1208,6 +1224,78 @@ def list_live_fixtures(limit: int = 200) -> list[dict]:
         d["txn_candidates"] = json.loads(d["txn_candidates_json"])
         out.append(d)
     return out
+
+
+# ---------- banks (per-tenant editable BANK_FEES + tolerance) ----------
+
+def _seed_default_banks(tenant_id: str) -> None:
+    """Idempotently seed the historical BANK_FEES table for a fresh tenant.
+    Customers see these as starter rows they can edit; they're free to
+    delete them entirely."""
+    from .config import BANK_FEES
+    now = _now()
+    with conn() as c:
+        for bank_id, pct in BANK_FEES.items():
+            c.execute(
+                "INSERT OR IGNORE INTO banks"
+                "(tenant_id, id, name, inbound_fee_pct, currency, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (tenant_id, bank_id, bank_id, float(pct), "MYR", now, now),
+            )
+
+
+def list_banks() -> list[dict]:
+    """All banks for the current tenant. Seeds defaults on first read."""
+    t = _t()
+    _seed_default_banks(t)
+    with conn() as c:
+        rows = c.execute(
+            "SELECT * FROM banks WHERE tenant_id = ? ORDER BY name",
+            (t,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_bank(bank_id: str) -> dict | None:
+    t = _t()
+    _seed_default_banks(t)
+    with conn() as c:
+        r = c.execute(
+            "SELECT * FROM banks WHERE tenant_id = ? AND id = ?",
+            (t, bank_id),
+        ).fetchone()
+    return dict(r) if r else None
+
+
+def upsert_bank(bank: dict) -> dict:
+    """Insert-or-update by (tenant_id, id). `id` is required."""
+    t = _t()
+    now = _now()
+    with conn() as c:
+        c.execute(
+            "INSERT INTO banks(tenant_id, id, name, inbound_fee_pct, "
+            "match_tolerance, currency, swift_bic, notes, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(tenant_id, id) DO UPDATE SET "
+            "name=excluded.name, inbound_fee_pct=excluded.inbound_fee_pct, "
+            "match_tolerance=excluded.match_tolerance, currency=excluded.currency, "
+            "swift_bic=excluded.swift_bic, notes=excluded.notes, "
+            "updated_at=excluded.updated_at",
+            (t, bank["id"], bank.get("name") or bank["id"],
+             float(bank["inbound_fee_pct"]),
+             bank.get("match_tolerance"), bank.get("currency"),
+             bank.get("swift_bic"), bank.get("notes"),
+             now, now),
+        )
+    return get_bank(bank["id"])
+
+
+def delete_bank(bank_id: str) -> None:
+    with conn() as c:
+        c.execute(
+            "DELETE FROM banks WHERE tenant_id = ? AND id = ?",
+            (_t(), bank_id),
+        )
 
 
 # ---------- tenant notes (per-account knowledge file) ----------

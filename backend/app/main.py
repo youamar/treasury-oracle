@@ -121,6 +121,37 @@ def _safe_inbox_path(filename: str) -> Path:
 def health(): return {"status": "ok"}
 
 
+# ---------- bank registry (C-5 + C-7) ----------
+
+class BankBody(BaseModel):
+    id: str
+    name: str | None = None
+    inbound_fee_pct: float
+    match_tolerance: float | None = None
+    currency: str | None = None
+    swift_bic: str | None = None
+    notes: str | None = None
+
+
+@app.get("/api/banks")
+def list_banks():
+    """Per-tenant bank registry. Used by the bank dropdown in the UI."""
+    return {"banks": db.list_banks()}
+
+
+@app.put("/api/banks/{bank_id}")
+def upsert_bank(bank_id: str, body: BankBody):
+    if body.id != bank_id:
+        raise HTTPException(400, "URL id and body id must match")
+    return db.upsert_bank(body.model_dump())
+
+
+@app.delete("/api/banks/{bank_id}")
+def delete_bank(bank_id: str):
+    db.delete_bank(bank_id)
+    return {"ok": True}
+
+
 # ---------- core pipeline ----------
 
 @app.post("/api/extract-proofs")

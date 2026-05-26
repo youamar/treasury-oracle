@@ -142,6 +142,7 @@ function Workspace() {
   const [parseInfo, setParseInfo] = useState(null);  // {skipped, columns_detected, warnings, row_count}
   const [result, setResult] = useState(null);
   const [bank, setBank] = useState("Maybank");
+  const [banks, setBanks] = useState([]);  // loaded from /api/banks per tenant
   const [busy, setBusy] = useState("");
   const [liveTrace, setLiveTrace] = useState([]);  // streaming agent events while busy
   const [toolsOpen, setToolsOpen] = useState(false);
@@ -153,6 +154,21 @@ function Workspace() {
   function appendProofs(newOnes) {
     setProofs((cur) => [...cur, ...newOnes]);
   }
+
+  useEffect(() => {
+    // Load the per-tenant bank registry on mount.
+    fetch(`${API}/banks`).then(r => r.json()).then(j => {
+      const list = j.banks || [];
+      setBanks(list);
+      // If the previously selected bank doesn't exist for this tenant,
+      // fall back to the first one.
+      if (list.length && !list.find(b => b.id === bank)) {
+        setBank(list[0].id);
+      }
+    }).catch(() => {});
+    // Only on mount — tenant changes trigger a re-mount via the Account gate.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function loadSampleData() {
     setProofs(SAMPLE_PROOFS);
@@ -489,8 +505,9 @@ function Workspace() {
               <label className="text-sm text-slate-600 dark:text-slate-400">Bank:</label>
               <select value={bank} onChange={(e) => setBank(e.target.value)}
                       className="border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 dark:text-slate-100 rounded px-2 py-1 text-sm">
-                <option>Maybank</option><option>CIMB</option><option>Public Bank</option>
-                <option>HSBC</option><option>Wise</option><option>default</option>
+                {(banks.length ? banks : [{id: "Maybank", name: "Maybank"}]).map(b => (
+                  <option key={b.id} value={b.id}>{b.name || b.id}</option>
+                ))}
               </select>
             </div>
             <button disabled={!stmtFile || busy} onClick={runParse}
