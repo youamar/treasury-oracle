@@ -1,0 +1,21 @@
+{
+  "id": "14_hard_currency_typo_in_narrative",
+  "difficulty": "hard",
+  "notes": "Bank narrative misspells the payer (ACEM instead of ACME) — tests fuzzy_compare's tolerance for OCR/keying errors. Strict amount + ref carry it.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 1200.00,
+    "currency": "USD",
+    "date": "2026-05-24",
+    "payer": "ACME Industrial Inc",
+    "payee": "BrightTech",
+    "reference": "INV-2026-014",
+    "source_file": "hard_14.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h14_a", "date": "2026-05-24", "amount": 5635.68, "currency": "MYR",
+     "description": "INWARD TT ACEM INDUSTRIA LREF INV-2026-014", "reference": "INV-2026-014"}
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_h14_a"
+}

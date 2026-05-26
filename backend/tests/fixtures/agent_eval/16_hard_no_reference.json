@@ -1,0 +1,21 @@
+{
+  "id": "16_hard_no_reference",
+  "difficulty": "hard",
+  "notes": "Proof has no reference field — agent must rely entirely on payer + amount + date to decide. Should be soft (operator confirmation) not strict.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 700.00,
+    "currency": "USD",
+    "date": "2026-05-25",
+    "payer": "No Ref Sender",
+    "payee": "BrightTech",
+    "reference": null,
+    "source_file": "hard_16.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h16_a", "date": "2026-05-25", "amount": 3287.48, "currency": "MYR",
+     "description": "INWARD TT NO REF SENDER", "reference": ""}
+  ],
+  "expected_decision": "soft",
+  "expected_txn_id": "txn_h16_a"
+}

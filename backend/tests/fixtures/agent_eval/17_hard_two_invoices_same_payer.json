@@ -1,0 +1,21 @@
+{
+  "id": "17_hard_two_invoices_same_payer",
+  "difficulty": "hard",
+  "notes": "Same payer paid TWO invoices in one transfer (consolidated). One txn, sum of two invoice amounts. Tests whether the agent recognizes consolidated payments — likely discrepancy with closest_txn pointing to the consolidated row.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 800.00,
+    "currency": "USD",
+    "date": "2026-05-26",
+    "payer": "Combo Customer",
+    "payee": "BrightTech",
+    "reference": "INV-2026-017",
+    "source_file": "hard_17.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h17_a", "date": "2026-05-26", "amount": 5635.68, "currency": "MYR",
+     "description": "INWARD TT COMBO CUSTOMER (INV-2026-017 + INV-2026-018)", "reference": "BATCH-99"}
+  ],
+  "expected_decision": "discrepancy",
+  "expected_txn_id": "txn_h17_a"
+}

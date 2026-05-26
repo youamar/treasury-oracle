@@ -1,0 +1,21 @@
+{
+  "id": "12_hard_partial_payment",
+  "difficulty": "hard",
+  "notes": "Payer sent only ~60% of invoice value (partial payment, common in real AR). Should be a discrepancy (not no_match) so the agent flags it for dunning rather than ignoring it.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 2000.00,
+    "currency": "USD",
+    "date": "2026-05-22",
+    "payer": "Slow Pay Co",
+    "payee": "BrightTech",
+    "reference": "INV-2026-PART",
+    "source_file": "hard_12.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h12_a", "date": "2026-05-22", "amount": 5664.00, "currency": "MYR",
+     "description": "INWARD TT SLOW PAY CO REF INV-2026-PART", "reference": "INV-2026-PART"}
+  ],
+  "expected_decision": "discrepancy",
+  "expected_txn_id": "txn_h12_a"
+}

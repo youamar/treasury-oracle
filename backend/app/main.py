@@ -235,6 +235,17 @@ def get_session_trace(recon_id: str):
     return {"trace": db.get_trace(recon_id)}
 
 
+@app.get("/api/session/{recon_id}/narrative")
+def get_session_narrative(recon_id: str, refresh: bool = False):
+    """Plain-English summary of the reconciliation for an exec / auditor.
+    Generated lazily and cached per session — set ?refresh=true to regenerate."""
+    from . import narrative as _narr
+    out = _narr.get_or_create(recon_id, force=refresh)
+    if out is None:
+        raise HTTPException(404, "session not found")
+    return out
+
+
 @app.get("/api/report/{recon_id}")
 def get_report(recon_id: str):
     s = db.load_session(recon_id)

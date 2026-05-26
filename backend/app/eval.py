@@ -48,6 +48,7 @@ def load_fixtures(directory: Path | None = None,
         for f in db.list_live_fixtures(limit=500):
             out.append({
                 "id": f["fixture_id"],
+                "difficulty": f.get("difficulty", "live"),
                 "notes": (f.get("notes") or "") + " [live]",
                 "bank": f.get("bank") or "default",
                 "proof": f["proof"],
@@ -62,6 +63,7 @@ def _case_verdict(case: dict, result: dict) -> dict:
     """Decide what the agent produced for this case, and whether it matches truth."""
     expected = case["expected_decision"]
     expected_txn = case.get("expected_txn_id")
+    difficulty = case.get("difficulty", "easy")
 
     matches = result.get("matches") or []
     softs = result.get("soft_matches") or []
@@ -102,6 +104,7 @@ def _case_verdict(case: dict, result: dict) -> dict:
 
     return {
         "id": case["id"],
+        "difficulty": difficulty,
         "expected_decision": expected,
         "predicted_decision": predicted,
         "expected_txn_id": expected_txn,
@@ -175,11 +178,28 @@ def _aggregate(verdicts: list[dict]) -> dict:
             "mean_confidence": round(sum(v["confidence"] for v in in_b) / len(in_b), 4),
         })
 
+    # Easy vs hard split — judges care more about adversarial accuracy than
+    # the happy path. A model that aces only the easy set is suspect.
+    easy = [v for v in verdicts if v.get("difficulty") != "hard"]
+    hard = [v for v in verdicts if v.get("difficulty") == "hard"]
+    by_difficulty = {}
+    if easy:
+        by_difficulty["easy"] = {
+            "n": len(easy),
+            "accuracy": round(sum(1 for v in easy if v["correct"]) / len(easy), 4),
+        }
+    if hard:
+        by_difficulty["hard"] = {
+            "n": len(hard),
+            "accuracy": round(sum(1 for v in hard if v["correct"]) / len(hard), 4),
+        }
+
     return {
         "n_cases": len(verdicts),
         "overall_accuracy": round(overall_acc, 4),
         "decision_accuracy": round(decision_acc, 4),
         "per_class": per_class_metrics,
+        "by_difficulty": by_difficulty,
         "brier_score": round(brier, 4) if brier is not None else None,
         "confidence_buckets": bucket_stats,
         "mean_tool_calls": round(sum(v["tool_call_count"] for v in verdicts) / n, 3),

@@ -1,0 +1,21 @@
+{
+  "id": "15_hard_date_window_edge",
+  "difficulty": "hard",
+  "notes": "Payment landed 4 days late — at the edge of the 5-day date window. SWIFT routing through 2 correspondents would justify this. Tests whether the agent invokes trace_swift_route.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 4500.00,
+    "currency": "EUR",
+    "date": "2026-05-19",
+    "payer": "Slow SWIFT GmbH",
+    "payee": "BrightTech",
+    "reference": "INV-2026-015",
+    "source_file": "hard_15.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h15_a", "date": "2026-05-23", "amount": 22829.55, "currency": "MYR",
+     "description": "INWARD TT SLOW SWIFT GMBH", "reference": "INV-2026-015"}
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_h15_a"
+}

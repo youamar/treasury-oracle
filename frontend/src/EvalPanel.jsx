@@ -196,6 +196,42 @@ export default function EvalPanel() {
                   delta={dm?.total_tokens_out ?? null} />
           </div>
 
+          {/* Easy vs Hard */}
+          {m.by_difficulty && Object.keys(m.by_difficulty).length > 0 && (
+            <Card title="Easy vs hard fixtures"
+                  subtitle="Judges care more about adversarial accuracy than the happy path.">
+              <div className="grid grid-cols-2 gap-3">
+                {Object.entries(m.by_difficulty).map(([level, s]) => {
+                  const pct = s.accuracy * 100;
+                  const col = pct >= 80 ? "green" : pct >= 60 ? "amber" : "red";
+                  return (
+                    <div key={level} className="border border-slate-200 rounded-lg p-3">
+                      <div className="flex justify-between items-center">
+                        <div>
+                          <div className="text-[11px] uppercase tracking-wider text-slate-500">
+                            {level} ({s.n} cases)
+                          </div>
+                          <div className="text-2xl font-semibold mt-1 tabular-nums">
+                            {pct.toFixed(1)}%
+                          </div>
+                        </div>
+                        <Badge color={col}>
+                          {col === "green" ? "strong" : col === "amber" ? "ok" : "weak"}
+                        </Badge>
+                      </div>
+                      <div className="mt-2 h-2 bg-slate-200 rounded-full overflow-hidden">
+                        <div className={`h-full ${
+                          col === "green" ? "bg-emerald-500" :
+                          col === "amber" ? "bg-amber-500" : "bg-red-500"
+                        }`} style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+
           {/* Per-class */}
           <Card title="Per-class metrics">
             <div className="overflow-x-auto -mx-5 px-5">

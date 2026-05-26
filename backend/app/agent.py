@@ -24,6 +24,7 @@ from .skills import (
     SkillContext, SKILL_REGISTRY, enabled_tool_skills, resolve_skill_config,
 )
 from .config import BANK_FEES
+from . import verifier as _verifier_mod
 
 
 def _build_provenance(decision: dict, proof: dict, chosen: dict | None,
@@ -611,9 +612,22 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
                 f"fx_source={untrusted_fx[0].get('source')}"
             )
 
-        # F2: second-pass verifier. Audits strict decisions for the common
-        # overconfidence patterns. Downgrades to soft if any concern fires.
-        verifier = _verify_decision(decision, proof, chosen, bank)
+        # F2: second-pass verifier ensemble.
+        # Pass 1 — deterministic skeptic (5 rules, free).
+        det_verifier = _verify_decision(decision, proof, chosen, bank)
+        # Pass 2 — LLM auditor (independent prompt, separate model call).
+        # Skipped when disabled by config, or when not a strict decision.
+        llm_enabled = bool(platform_cfg.get("verifier_llm_enabled", True))
+        if llm_enabled and d == "strict" and chosen is not None:
+            llm_verifier = _verifier_mod.llm_verify(
+                decision, proof, chosen, bank,
+                model_profile=platform_cfg.get("verifier_model_profile", "cheap"),
+                temperature=0.0,
+            )
+        else:
+            llm_verifier = {"ran": False, "verdict": "skip", "concerns": [],
+                            "method": "llm_verifier_v1", "reasoning": ""}
+        verifier = _verifier_mod.merge_verifiers(det_verifier, llm_verifier)
         if verifier["verdict"] == "downgrade":
             classical_trace.append(
                 f"  [!] verifier downgraded strict→soft: "

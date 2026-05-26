@@ -1,0 +1,26 @@
+{
+  "id": "18_hard_zero_amount_ocr",
+  "difficulty": "hard",
+  "notes": "OCR returned 0 for amount (vision LLM couldn't read it). Quality gate should fire and the agent must NOT attempt a match — strict here would be a real-money bug.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 0,
+    "currency": "USD",
+    "date": "2026-05-26",
+    "payer": "Blurry Receipt",
+    "payee": "BrightTech",
+    "reference": "INV-2026-018",
+    "source_file": "hard_18_blurry.png",
+    "ocr_quality": {
+      "completeness": 0.35,
+      "missing_fields": ["amount"],
+      "gate": "low_quality"
+    }
+  },
+  "txn_candidates": [
+    {"id": "txn_h18_a", "date": "2026-05-26", "amount": 4700.00, "currency": "MYR",
+     "description": "INWARD TT BLURRY", "reference": "INV-2026-018"}
+  ],
+  "expected_decision": "no_match",
+  "expected_txn_id": null
+}

@@ -145,6 +145,8 @@ function Workspace() {
   const [busy, setBusy] = useState("");
   const [liveTrace, setLiveTrace] = useState([]);  // streaming agent events while busy
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [narrative, setNarrative] = useState(null);
+  const [narrativeBusy, setNarrativeBusy] = useState(false);
   const [dunningTarget, setDunningTarget] = useState(null);
   const [view, setView] = useState("recon"); // "recon" | "settings" | "memory"
 
@@ -275,11 +277,29 @@ function Workspace() {
           message: `${s.matched || 0} matched · ${s.soft_matches || 0} soft · ${s.unmatched_proofs || 0} discrepancies`,
         });
       }
+      // Kick off the narrative in the background; UI shows a skeleton.
+      if (j.recon_id) loadNarrative(j.recon_id, false);
     } catch (e) {
       pushToast({ kind: "error", title: "Reconcile failed", message: String(e) });
     }
     polling = false;
     setBusy("");
+  }
+
+  async function loadNarrative(reconId, refresh) {
+    if (!reconId) return;
+    setNarrativeBusy(true);
+    if (refresh) setNarrative(null);
+    try {
+      const r = await fetch(`${API}/session/${reconId}/narrative${refresh ? "?refresh=true" : ""}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      setNarrative(j);
+    } catch (e) {
+      pushToast({ kind: "warn", title: "Narrative unavailable",
+                  message: String(e?.message || e) });
+    }
+    setNarrativeBusy(false);
   }
 
   async function sha256Short(s) {
@@ -663,6 +683,60 @@ function Workspace() {
 
         {result && (
           <section className="space-y-4">
+            {/* AI narrative — what just happened, in plain English */}
+            {(narrative || narrativeBusy) && (
+              <div className="bg-gradient-to-br from-indigo-50 to-purple-50 border border-indigo-200 rounded-xl p-5">
+                <div className="flex items-start justify-between gap-3 mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl">📝</span>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider text-indigo-600 font-bold">
+                        AI summary
+                      </div>
+                      {narrative?.headline && (
+                        <div className="font-semibold text-slate-900">{narrative.headline}</div>
+                      )}
+                    </div>
+                  </div>
+                  <button onClick={() => loadNarrative(result?.recon_id, true)}
+                          disabled={narrativeBusy}
+                          className="text-xs text-indigo-700 hover:text-indigo-900 underline disabled:opacity-50">
+                    {narrativeBusy ? "regenerating…" : "regenerate"}
+                  </button>
+                </div>
+                {narrativeBusy && !narrative ? (
+                  <div className="space-y-2 mt-2">
+                    <div className="h-3 bg-indigo-100 rounded animate-pulse w-3/4" />
+                    <div className="h-3 bg-indigo-100 rounded animate-pulse w-full" />
+                    <div className="h-3 bg-indigo-100 rounded animate-pulse w-5/6" />
+                  </div>
+                ) : narrative && (
+                  <>
+                    <div className="space-y-2 text-sm text-slate-800">
+                      {(narrative.paragraphs || []).map((p, i) => <p key={i}>{p}</p>)}
+                    </div>
+                    {(narrative.action_items || []).length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-indigo-200">
+                        <div className="text-[11px] uppercase tracking-wider text-indigo-700 font-bold mb-1">
+                          Next steps
+                        </div>
+                        <ul className="text-sm space-y-1">
+                          {narrative.action_items.map((a, i) => (
+                            <li key={i} className="text-slate-700">→ {a}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {narrative.generated === "fallback" && (
+                      <div className="mt-2 text-[10px] text-amber-700">
+                        ⚠ LLM unavailable — using deterministic template
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               {[
                 ["Proofs", result.summary.total_proofs, "slate"],

@@ -410,3 +410,93 @@ def test_verifier_skips_non_strict_decisions(sample_proof, sample_txn, monkeypat
                         lambda use_fallback=False: _make_client(script))
     out = agent_mod.reconcile_agent([sample_proof], [sample_txn], "Maybank")
     assert out["summary"]["unmatched_proofs"] == 1
+
+
+def test_llm_verifier_can_downgrade_clean_strict(sample_proof, sample_txn, monkeypatch):
+    """F2.5 ensemble: even if the deterministic skeptic confirms (clean strict
+    match), an LLM verifier rejecting it must downgrade to soft."""
+    import json
+    from app import agent as agent_mod, verifier as v_mod
+
+    txn = {**sample_txn, "description": "INWARD TT ACME CORP INV-2026-001",
+           "reference": "INV-2026-001"}
+    expected_net = round(1000 * 4.72 * 0.995, 2)
+    script = [
+        {"tool_calls": [{"name": "get_fx_rate",
+                         "arguments": {"from_ccy": "USD", "to_ccy": "MYR",
+                                       "date": "2026-05-20"}}]},
+        {"tool_calls": [{"name": "apply_bank_fee",
+                         "arguments": {"amount": 4720.0, "bank_name": "Maybank"}}]},
+        {"content": json.dumps({
+            "decision": "strict", "txn_index": 0,
+            "fx_rate": 4.72, "fee_amount": 23.6,
+            "expected_net": expected_net, "actual": txn["amount"],
+            "confidence": 0.99, "fuzzy_signals": [], "swift_route": None,
+            "reasoning": "Within tolerance after fees.",
+        })},
+    ]
+    monkeypatch.setattr(agent_mod, "get_client",
+                        lambda use_fallback=False: _make_client(script))
+
+    # Override the verifier stub to REJECT this match.
+    class _RejectClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kw):
+                    class _M:
+                        content = json.dumps({
+                            "verdict": "reject",
+                            "concerns": ["payer is a personal account, not a business entity"],
+                            "reasoning": "MysteryCo isn't credibly the payer for Acme.",
+                        })
+                        tool_calls = None
+                    class _R: choices = [type("C", (), {"message": _M})]
+                    return _R()
+    monkeypatch.setattr(v_mod, "get_client", lambda use_fallback=False: _RejectClient())
+
+    out = agent_mod.reconcile_agent([sample_proof], [txn], "Maybank")
+    assert out["summary"]["matched"] == 0
+    assert out["summary"]["soft_matches"] == 1
+    sm = out["soft_matches"][0]
+    prov_v = sm["conversion"]["provenance"]["verifier"]
+    assert prov_v["verdict"] == "downgrade"
+    assert prov_v["ensemble"] == "llm_downgrade"
+    assert any("llm" in c.lower() or "payer" in c.lower() for c in prov_v["concerns"])
+
+
+def test_llm_verifier_skipped_when_disabled(sample_proof, sample_txn, monkeypatch):
+    """Tenant can opt out of the LLM verifier via platform_config. The
+    deterministic skeptic still runs; only the second LLM pass is skipped."""
+    import json
+    from app import agent as agent_mod, platform_config as pc
+
+    txn = {**sample_txn, "description": "INWARD TT ACME CORP INV-2026-001",
+           "reference": "INV-2026-001"}
+    expected_net = round(1000 * 4.72 * 0.995, 2)
+    script = [
+        {"tool_calls": [{"name": "get_fx_rate",
+                         "arguments": {"from_ccy": "USD", "to_ccy": "MYR",
+                                       "date": "2026-05-20"}}]},
+        {"tool_calls": [{"name": "apply_bank_fee",
+                         "arguments": {"amount": 4720.0, "bank_name": "Maybank"}}]},
+        {"content": json.dumps({
+            "decision": "strict", "txn_index": 0,
+            "fx_rate": 4.72, "fee_amount": 23.6,
+            "expected_net": expected_net, "actual": txn["amount"],
+            "confidence": 0.99, "fuzzy_signals": [], "swift_route": None,
+            "reasoning": "Within tolerance after fees.",
+        })},
+    ]
+    monkeypatch.setattr(agent_mod, "get_client",
+                        lambda use_fallback=False: _make_client(script))
+
+    cfg = pc.load_config()
+    cfg["verifier_llm_enabled"] = False
+    pc.save_config(cfg)
+
+    out = agent_mod.reconcile_agent([sample_proof], [txn], "Maybank")
+    assert out["summary"]["matched"] == 1
+    v = out["matches"][0]["conversion"]["provenance"]["verifier"]
+    assert v["ensemble"] == "deterministic_only"
+    assert v["llm_verifier"]["ran"] is False

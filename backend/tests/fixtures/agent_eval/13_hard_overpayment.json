@@ -1,0 +1,21 @@
+{
+  "id": "13_hard_overpayment",
+  "difficulty": "hard",
+  "notes": "Payer rounded up — sent more than invoiced. Edge case the agent often classifies as discrepancy when it should be strict (within tolerance OR explicit overpayment).",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 500.00,
+    "currency": "SGD",
+    "date": "2026-05-23",
+    "payer": "Round Up Pte",
+    "payee": "BrightTech",
+    "reference": "INV-2026-RND",
+    "source_file": "hard_13.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h13_a", "date": "2026-05-23", "amount": 1768.00, "currency": "MYR",
+     "description": "INWARD TT ROUND UP PTE", "reference": "INV-2026-RND"}
+  ],
+  "expected_decision": "discrepancy",
+  "expected_txn_id": "txn_h13_a"
+}

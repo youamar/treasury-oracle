@@ -130,6 +130,27 @@ def mock_chutes(monkeypatch):
     def _fake_get_client(use_fallback=False): return _StubClient()
     monkeypatch.setattr(ag_mod, "get_client", _fake_get_client)
 
+    # The verifier module also calls get_client — mock it too. Default behavior:
+    # confirm every strict claim so the verifier doesn't accidentally downgrade
+    # legitimate test matches. Tests that want a rejecting verifier override
+    # this fixture with their own monkeypatch.
+    try:
+        import app.verifier as v_mod
+        class _VerifierStub:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(**kw):
+                        class _M:
+                            content = '{"verdict":"confirm","concerns":[],"reasoning":"stub"}'
+                            tool_calls = None
+                        class _R: choices = [type("C", (), {"message": _M})]
+                        return _R()
+        monkeypatch.setattr(v_mod, "get_client",
+                            lambda use_fallback=False: _VerifierStub())
+    except Exception:
+        pass
+
 
 @pytest.fixture
 def sample_proof():

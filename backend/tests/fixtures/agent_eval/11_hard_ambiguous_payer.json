@@ -1,0 +1,23 @@
+{
+  "id": "11_hard_ambiguous_payer",
+  "difficulty": "hard",
+  "notes": "Two candidate txns both within FX tolerance — only the reference distinguishes the right one. Tests whether the agent over-relies on amount alone vs cross-checking reference.",
+  "bank": "Maybank",
+  "proof": {
+    "amount": 850.00,
+    "currency": "EUR",
+    "date": "2026-05-21",
+    "payer": "Berlin Designs GmbH",
+    "payee": "BrightTech",
+    "reference": "INV-2026-002",
+    "source_file": "hard_11.png"
+  },
+  "txn_candidates": [
+    {"id": "txn_h11_a", "date": "2026-05-21", "amount": 4313.32, "currency": "MYR",
+     "description": "INWARD TT BERLIN DESIGNS", "reference": "INV-2026-002"},
+    {"id": "txn_h11_b", "date": "2026-05-21", "amount": 4317.10, "currency": "MYR",
+     "description": "INWARD TT BERLIN", "reference": "OTHER-099"}
+  ],
+  "expected_decision": "strict",
+  "expected_txn_id": "txn_h11_a"
+}
