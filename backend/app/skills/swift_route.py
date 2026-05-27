@@ -52,4 +52,27 @@ SKILL = register(SkillDef(
     category="reconciliation",
     tags=("swift", "agent-tool"),
     model_profile="strong",
+    examples=[{
+        "args": {"source_currency": "USD", "sent_amount": 1000,
+                 "expected_net_local": 4696.4, "actual_net_local": 4661.4,
+                 "fx_rate": 4.72, "local_currency": "MYR"},
+        "result": {"route": [{"bank": "JPMorgan Chase NY", "fee": 25.0,
+                              "role": "correspondent"}],
+                   "attributed_fee_local": 35.0, "unexplained_gap_local": 0.0},
+        "when": "explain why USD->MYR settlement came in 35 MYR short",
+    }],
+    error_hint=(
+        "trace_swift_route takes six args: source_currency, sent_amount, "
+        "expected_net_local, actual_net_local, fx_rate, local_currency. "
+        "All amounts are numbers (not strings). sent_amount is in the "
+        "PROOF currency; expected_net_local + actual_net_local are in the "
+        "BANK's local currency. fx_rate is the multiplier from source to "
+        "local (sent_amount * fx_rate ≈ expected_gross_local before fees)."
+    ),
+    triggers={
+        # SWIFT correspondent-bank inference is only meaningful for cross-
+        # border payments. Same-currency proofs go through ACH/local rails,
+        # no SWIFT hops to attribute.
+        "cross_currency_only": True,
+    },
 ))

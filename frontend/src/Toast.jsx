@@ -145,3 +145,26 @@ export async function apiFetch(input, init = {}) {
     throw e;
   }
 }
+
+
+/** Fetch a file with auth, then trigger a browser download. Use this for
+ *  PDFs / audit packs — a raw `<a href>` or `window.open` skips the
+ *  Authorization header, so multi-tenant scoping breaks and the backend
+ *  returns 404. */
+export async function downloadAuthed(url, filename) {
+  const r = await apiFetch(url);
+  if (!r.ok) {
+    // apiFetch already toasted the error detail; just bail.
+    throw new Error(`download failed: ${r.status}`);
+  }
+  const blob = await r.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = blobUrl;
+  a.download = filename || "download";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoke after a tick so the click has finished using the URL.
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}

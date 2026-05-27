@@ -45,6 +45,27 @@ class SkillDef:
     # need a powerful model (e.g. fuzzy compare) point at 'cheap'; skills
     # like SWIFT inference can point at 'strong'.
     model_profile: str = "default"
+    # One-shot usage examples rendered into the agent system prompt so the
+    # LLM sees a concrete (args -> result) pairing per skill. Cuts retry
+    # rounds caused by the LLM guessing the schema shape. Each entry:
+    #   {"args": {<kwargs>}, "result": {<shape>}, "when": "short scenario"}
+    # Cap at 2 per skill — prompt budget matters with reasoning models.
+    examples: list[dict] = field(default_factory=list)
+    # Action-oriented coaching string surfaced verbatim to the LLM when
+    # this skill's handler raises TypeError (LLM_TOOL_MISUSE). Embed the
+    # exact format / arg-name expectation here so the LLM fixes it on
+    # the next turn instead of guessing.
+    error_hint: str = ""
+    # Trigger-based applicability — narrows which proofs see this skill.
+    # Keys (all optional; missing = no constraint):
+    #   "cross_currency_only": bool  → skip if proof.currency == bank currency
+    #   "applicable_currencies": list[str]
+    #       → only offer when proof.currency matches one of these (uppercased)
+    #   "requires_candidates": bool  → skip if no candidate txns
+    # Memory / always-on skills set nothing here. Without pruning we ship
+    # 6 tools per LLM call × 6 steps × N proofs; pruning typically halves
+    # the tool-spec section of the system prompt on simple cases.
+    triggers: dict = field(default_factory=dict)
 
     def to_openai_tool(self) -> dict:
         return {

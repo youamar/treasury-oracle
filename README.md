@@ -44,10 +44,27 @@ Bank statement ──► CSV/XLSX parser ──► transactions + drift/skipped 
   `conversion.provenance.{proof_amount, fx_rate, fee, expected_*, actual_received}`
   with `{value, source, asof, trusted}`. LLM-invented numbers are tagged
   `agent_unverified`. Rendered in the audit-pack PDF §5.5.
-- **Two-pass verify** — a deterministic skeptic audits every strict claim
-  against 5 overconfidence patterns (diff > 0.5%, date gap, no tool calls,
-  no ref overlap, no payer overlap). Downgrades to soft with traceable
-  concerns. Zero extra LLM tokens.
+- **F2 ensemble verifier** — a deterministic skeptic audits every strict
+  claim against 5 overconfidence patterns (diff > 0.5%, date gap, no tool
+  calls, no ref overlap, no payer overlap), paired with an LLM auditor that
+  can reject the agent's answer and force a retry. Downgrades to soft with
+  traceable concerns.
+- **Bounded reflection loop** — the agent re-reads its own draft once and
+  can call additional skills before committing.
+- **Per-tenant agent knobs** — `MAX_STEPS`, match tolerance, reflection
+  threshold, model profile, temperature, **and the base system prompt**
+  live in `platform_config.agent_knobs`, editable from the Settings UI
+  without a redeploy.
+- **Per-tenant memory** — a `tenant_notes` table (MEMORY.md pattern)
+  auto-injected into the agent's system prompt on every run.
+- **Per-tenant banks + FX fallback rates** — no hardcoded constants;
+  both seed from the old defaults on first read, then become editable.
+- **Continuous regression gate** — labelled fixtures + an adversarial
+  hard-set; `python -m app.eval_gate` exits 1 on accuracy drop or any
+  hard-fixture regression; `/api/eval/gate` endpoint + UI card.
+- **Signed Audit Pack** — Ed25519 manifest on the last page
+  (`app/attestation.py`); source-bytes verified against `raw_uploads`
+  SHA before issuance. Same keypair signs session tokens.
 - **FX trust guardrail** — `get_fx_rate_full` returns `{rate, source, trusted}`;
   the agent refuses strict matches on static-fallback rates.
 - **OCR quality gate** — weighted completeness score per proof. Low-quality
@@ -58,12 +75,15 @@ Bank statement ──► CSV/XLSX parser ──► transactions + drift/skipped 
   soft-match confirmations. Per-class precision/recall/F1, calibration
   buckets, mean tool-calls, token + latency rollups. `temperature=0` by
   default so reruns are reproducible.
-- **Reliability** — retry policy + circuit breaker per upstream source
-  (`app/reliability.py`); SQLite per-thread connection pool with WAL +
-  `busy_timeout=30s`; typed JSON encoder (`safe_dumps`) so Decimals don't
-  silently round-trip as strings.
-- **Multi-tenant** — every table scoped by `tenant_id` (contextvar +
-  `x-tenant-id` header); platform config keyed on `(tenant_id, id)`.
+- **Reliability** — `with_retry` wrapper + DB-backed circuit breakers
+  shared across uvicorn workers via the `breaker_states` table;
+  per-tenant rate limits on LLM-spending endpoints; bounded LLM
+  concurrency (`AGENT_LLM_CONCURRENCY`, default 4). SQLite per-thread
+  connection pool with WAL + `busy_timeout=30s`; typed JSON encoder
+  (`safe_dumps`) so Decimals don't silently round-trip as strings.
+- **Multi-tenant** — every table scoped by `tenant_id`. The
+  `Authorization: Bearer <token>` header is authoritative;
+  `x-tenant-id` is back-compat only and never overrides the token.
 - **Idempotency** — `/api/reconcile` accepts `Idempotency-Key`; tab-refresh
   returns the cached recon_id instead of re-spending tokens. 409 on key
   reuse with a different body.
@@ -78,7 +98,12 @@ Bank statement ──► CSV/XLSX parser ──► transactions + drift/skipped 
 - **Backend**: FastAPI · OpenAI SDK (Chutes-compatible) · ReportLab · pandas ·
   scikit-learn (calibration) · LangGraph (durable workflows) · SQLite
 - **Frontend**: React + Vite + Tailwind
-- **LLM**: `google/gemma-4-31B-turbo-TEE` on [Chutes.ai](https://chutes.ai)
+- **LLM**: vision via `google/gemma-4-31B-turbo-TEE`; reasoning via a Chutes
+  **pool** (`GLM-5.1`, `Qwen3.5-397B`, `MiniMax-M2.5` — all TEE variants)
+  routed `:latency` so each step picks the lowest-TTFT model. See
+  `backend/.env.example`.
+- **Auth**: bcrypt passwords + Ed25519-signed session tokens; the same
+  keypair signs the Audit Pack manifest, so the trust root is one artifact.
 - **FX data**: frankfurter.app (ECB) · exchangerate.host fallback · static
   baked-in fallback (always tagged `trusted=false`)
 
@@ -112,7 +137,7 @@ Open http://localhost:5173.
 
 ```powershell
 cd backend
-.\.venv\Scripts\python -m pytest tests/    # 174/174 green
+.\.venv\Scripts\python -m pytest tests/    # 213/213 green
 ```
 
 ## Demo flow

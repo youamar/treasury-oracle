@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .chutes_client import chat
+from .chutes_client import chat, last_provider
 from .config import MODEL_PROFILES
 from . import reliability, db
 
@@ -48,15 +48,19 @@ Return STRICT JSON:
 
 def _digest_session(session: dict) -> str:
     """Compact JSON the LLM can read — strips verbose proof images / trace blobs."""
+    # Defensive: a malformed match (missing proof/txn) shouldn't 500 the
+    # whole narrative endpoint. Default to {} so .get() still works.
     matches_digest = []
     for m in session.get("matches", []) or []:
+        proof = m.get("proof") or {}
+        txn = m.get("txn") or {}
         prov = (m.get("conversion") or {}).get("provenance") or {}
         verifier = prov.get("verifier") or {}
         matches_digest.append({
-            "ref": m["proof"].get("reference"),
-            "payer": m["proof"].get("payer"),
-            "amount_proof": f"{m['proof'].get('amount')} {m['proof'].get('currency')}",
-            "amount_received": f"{m['txn'].get('amount')} {m['txn'].get('currency')}",
+            "ref": proof.get("reference"),
+            "payer": proof.get("payer"),
+            "amount_proof": f"{proof.get('amount')} {proof.get('currency')}",
+            "amount_received": f"{txn.get('amount')} {txn.get('currency')}",
             "confidence": m.get("confidence"),
             "verifier_verdict": verifier.get("verdict"),
             "verifier_ensemble": verifier.get("ensemble"),
@@ -66,11 +70,13 @@ def _digest_session(session: dict) -> str:
 
     soft_digest = []
     for s in session.get("soft_matches", []) or []:
+        proof = s.get("proof") or {}
+        txn = s.get("txn") or {}
         soft_digest.append({
-            "ref": s["proof"].get("reference"),
-            "payer": s["proof"].get("payer"),
-            "amount": f"{s['proof'].get('amount')} {s['proof'].get('currency')}",
-            "txn_amount": f"{s['txn'].get('amount')} {s['txn'].get('currency')}",
+            "ref": proof.get("reference"),
+            "payer": proof.get("payer"),
+            "amount": f"{proof.get('amount')} {proof.get('currency')}",
+            "txn_amount": f"{txn.get('amount')} {txn.get('currency')}",
             "signals": s.get("signals"),
             "reasoning": s.get("reasoning"),
         })
@@ -96,16 +102,9 @@ def _digest_session(session: dict) -> str:
 
 
 def _strip_fences(text: str) -> str:
-    t = (text or "").strip()
-    if not t.startswith("```"):
-        return t
-    parts = t.split("```")
-    if len(parts) < 2:
-        return t
-    inner = parts[1]
-    if inner.startswith("json"):
-        inner = inner[4:]
-    return inner.strip()
+    # Thin alias kept for backwards-compat with existing call sites.
+    from .chutes_client import strip_code_fences
+    return strip_code_fences(text)
 
 
 def generate_narrative(session: dict,
@@ -124,16 +123,18 @@ def generate_narrative(session: dict,
             ],
             model=model,
             temperature=0.4,
-            max_tokens=600,
+            max_tokens=2000,
             response_format={"type": "json_object"},
-            timeout=timeout,
+            timeout=max(timeout, 60),
+            retry_policy=reliability.ONE_SHOT_POLICY,
         )
     except Exception as e:
         reliability.record_error("narrative.generate", e,
                                  context={"recon_id": session.get("recon_id")})
         return _fallback_narrative(session, reason=f"{type(e).__name__}: {e}")
 
-    raw = _strip_fences((resp.choices[0].message.content or "").strip())
+    from .chutes_client import extract_content
+    raw = _strip_fences(extract_content(resp).strip())
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -145,6 +146,13 @@ def generate_narrative(session: dict,
     data.setdefault("action_items", [])
     data.setdefault("headline", "Reconciliation complete")
     data["generated"] = "llm"
+    prov = last_provider() or {}
+    if prov.get("provider"):
+        data["provider"] = {
+            "name": prov.get("provider"),
+            "model": prov.get("model"),
+            "fallback_from": prov.get("fallback_from", []),
+        }
     return data
 
 

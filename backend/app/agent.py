@@ -11,10 +11,17 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
-from .chutes_client import get_client
+from . import llm_router
+from . import chutes_client
+# Re-exported for the test suite's mock_chutes fixture (conftest.py
+# monkeypatches `app.agent.get_client` and `app.agent.chutes_client.
+# _call_primary`). Production code paths go through chutes_client.chat
+# which transparently delegates to llm_router for failover.
+from .chutes_client import get_client  # noqa: F401
 from .config import REASONING_MODEL, MATCH_TOLERANCE
 from . import db
 from . import platform_config
@@ -141,6 +148,96 @@ import threading as _threading
 import os as _os
 AGENT_LLM_CONCURRENCY = int(_os.getenv("AGENT_LLM_CONCURRENCY", "4"))
 _agent_llm_semaphore = _threading.BoundedSemaphore(AGENT_LLM_CONCURRENCY)
+
+# --- Auto-disable for skills that keep raising SKILL_BUG -----------------
+# When a skill's handler throws an internal exception (NOT a bad-arg from
+# the LLM), we track it per-tenant in SQLite (`skill_health` table) with a
+# 24h sliding disable window. Two consecutive failures → skill drops out
+# of the agent's tool spec until an operator re-enables it. Promoted from
+# the old in-memory dict so a skill that's broken for one tenant doesn't
+# waste agent tokens on EVERY reconcile run.
+_SKILL_AUTODISABLE_THRESHOLD = int(_os.getenv("SKILL_AUTODISABLE_THRESHOLD", "2"))
+
+
+def _record_skill_failure(session_id: str, skill_id: str, error: str = "") -> int:
+    """Bump the persistent failure counter for the current tenant's skill.
+    Returns the new consecutive-failure count. `session_id` is no longer
+    used for keying but kept in the signature so call sites don't need to
+    change — the tenant comes from db._t() (ContextVar)."""
+    _ = session_id  # tenant scope is implicit via db._t()
+    row = db.record_skill_failure(
+        skill_id, threshold=_SKILL_AUTODISABLE_THRESHOLD, error=error,
+    )
+    return int(row.get("consecutive_failures") or 0)
+
+
+def _disabled_skills_for(session_id: str) -> set[str]:
+    """Skills currently auto-disabled for the active tenant. `session_id`
+    accepted for backwards-compat with old callers; the DB is the truth."""
+    _ = session_id
+    return db.list_disabled_skills()
+
+
+def _clear_session_skill_failures(session_id: str) -> None:
+    """No-op now — disable state is persistent and only an operator
+    `reenable_skill` should clear it. Kept so reconcile_agent's existing
+    call site doesn't need to be removed."""
+    _ = session_id
+
+
+# --- Trigger-based skill pruning (delta #6) -------------------------------
+
+def _bank_currency(bank: str) -> str | None:
+    """Resolve the bank's settlement currency for trigger evaluation.
+    Best-effort — returns None if the bank isn't in the registry, which
+    just means we don't prune anything for that case (safer than wrong)."""
+    try:
+        row = db.get_bank(bank)
+    except Exception:
+        return None
+    return (row or {}).get("currency") or None
+
+
+def _skill_applies(skill, proof: dict, candidates: list,
+                   bank_currency: str | None) -> tuple[bool, str]:
+    """Decide whether `skill` should be offered for THIS proof.
+
+    Returns (applies, reason_if_pruned). Reason is empty when applies=True
+    and used in the trace event when applies=False so the operator can
+    see why a tool was hidden from the agent.
+    """
+    trig = getattr(skill, "triggers", None) or {}
+    if not trig:
+        return True, ""
+    # `requires_candidates` — pruning a candidate-needing skill when there
+    # are zero candidates avoids wasted reasoning ("I'd like to fuzzy_compare
+    # but there's nothing to compare to").
+    if trig.get("requires_candidates") and not candidates:
+        return False, "no candidate transactions to compare against"
+    # `cross_currency_only` — only useful when the proof currency differs
+    # from the bank's settlement currency. Skip FX skills on SGD->SGD etc.
+    if trig.get("cross_currency_only"):
+        pc = (proof.get("currency") or "").upper()
+        bc = (bank_currency or "").upper()
+        if pc and bc and pc == bc:
+            return False, f"same-currency proof ({pc}) — no FX/SWIFT needed"
+    # `applicable_currencies` — whitelist (e.g. "trace_swift_route only on
+    # the corridor we have route data for"). Empty list = always applies.
+    allow = trig.get("applicable_currencies") or []
+    if allow:
+        pc = (proof.get("currency") or "").upper()
+        if pc and pc not in {c.upper() for c in allow}:
+            return False, f"proof currency {pc!r} not in skill's whitelist {allow}"
+    return True, ""
+
+
+# Per-proof LLM dispatch is inlined in `_run_one_proof`:
+#   - In tests, `get_client` is monkeypatched to return a scripted stub.
+#     We build the client once per proof so its scripted state advances
+#     across steps (the lambda creates a fresh state dict each call, so
+#     re-creating the client would replay script[0] forever).
+#   - In production, `get_client is chutes_client.get_client`, so we route
+#     through `chutes_client.chat` for retry/failover/breaker integration.
 
 # Reflection — when the agent's first decision is shaky, we let it re-plan
 # once. Triggers below cover the patterns we've actually seen in eval runs.
@@ -364,6 +461,20 @@ def _compose_system_prompt(tool_skills: list, platform_cfg: dict) -> str:
     for s in tool_skills:
         sc = resolve_skill_config(s, platform_cfg)
         sections.append(f"- {s.id}: {sc.get('system_prompt', '').strip()}")
+        # One concrete (args -> result) example per skill, when defined.
+        # This is the single highest-leverage thing for cutting "LLM
+        # guesses the wrong arg shape and burns a retry" rounds: a worked
+        # example beats a schema description every time.
+        for ex in (getattr(s, "examples", []) or [])[:1]:
+            args_str = json.dumps(ex.get("args", {}), ensure_ascii=False)
+            result_str = json.dumps(ex.get("result", {}), ensure_ascii=False)
+            if len(result_str) > 140:
+                result_str = result_str[:137] + "…"
+            when = ex.get("when", "")
+            line = f"    e.g. {s.id}({args_str}) -> {result_str}"
+            if when:
+                line += f"  // {when}"
+            sections.append(line)
     return "\n".join(sections)
 
 
@@ -398,40 +509,168 @@ def _build_user_prompt(proof: dict, candidates: list[dict], bank: str) -> str:
 
 
 def _extract_final_json(content: str) -> dict | None:
+    """Best-effort JSON extraction from raw LLM text. Handles plain JSON,
+    fenced ```json blocks, and embedded JSON inside reasoning text (via the
+    last-balanced-{} salvage in extract_content). Returns None on failure
+    so callers can decide whether to coach the LLM or fall back."""
+    from .chutes_client import strip_code_fences, _last_json_block
     if not content:
         return None
-    txt = content.strip()
-    if txt.startswith("```"):
-        parts = txt.split("```")
-        if len(parts) >= 2:
-            inner = parts[1]
-            if inner.startswith("json"):
-                inner = inner[4:]
-            txt = inner.strip()
+    txt = strip_code_fences(content)
     try:
         return json.loads(txt)
     except json.JSONDecodeError:
-        return None
+        pass
+    # Salvage attempt — find the last balanced {...} block. Reasoning
+    # models often emit the JSON answer at the end of a longer narration.
+    salvaged = _last_json_block(txt)
+    if salvaged:
+        try:
+            return json.loads(salvaged)
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
-def _dispatch_skill(skill_id: str, args: dict, ctx: SkillContext) -> Any:
+# ---------- Decision schema ------------------------------------------------
+# Pydantic-validate the agent's final JSON before downstream code touches it.
+# Catches the three classes of LLM-shape-drift that used to crash the
+# verifier / matching path silently:
+#   1. wrong case: {"decision": "STRICT"}  -> normalized to "strict"
+#   2. missing field: no `confidence` -> defaulted to 0.0 with a coaching note
+#   3. wrong type: "txn_index": "0" (string) -> coerced to int when possible
+
+import re as _re
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+
+_VALID_DECISIONS = {"strict", "soft", "discrepancy", "no_match"}
+
+
+class _DecisionSchema(BaseModel):
+    """Canonical shape the agent must produce. Normalization happens in
+    field validators so common LLM stylistic drift (uppercase decision,
+    quoted numbers) doesn't fail the call."""
+    decision: str
+    txn_index: int | None = None
+    fx_rate: float | None = None
+    fee_amount: float | None = None
+    expected_net: float | None = None
+    actual: float | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    fuzzy_signals: list[str] = Field(default_factory=list)
+    swift_route: dict | None = None
+    reasoning: str = ""
+
+    @field_validator("decision")
+    @classmethod
+    def _normalize_decision(cls, v: str) -> str:
+        n = (v or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if n not in _VALID_DECISIONS:
+            raise ValueError(
+                f"decision must be one of {sorted(_VALID_DECISIONS)}, got {v!r}"
+            )
+        return n
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence(cls, v):
+        # Some models emit '0.95', '95%' or '95' for confidence. Normalize.
+        if v is None or v == "":
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v) / 100.0 if v > 1.0 else float(v)
+        if isinstance(v, str):
+            s = v.strip().rstrip("%")
+            try:
+                f = float(s)
+                return f / 100.0 if f > 1.0 else f
+            except ValueError:
+                return 0.0
+        return 0.0
+
+
+def _validate_decision(raw: dict) -> tuple[dict | None, str | None]:
+    """Validate + normalize the LLM's decision JSON.
+
+    Returns (normalized_dict, None) on success.
+    Returns (None, coaching_message) when the LLM's output can't be
+    coerced — the caller injects the coaching message back into the
+    conversation so the LLM can fix it on the next turn. The coaching
+    message names the specific fields that failed."""
+    if not isinstance(raw, dict):
+        return None, "Your response must be a JSON object, not a list or string."
+    try:
+        model = _DecisionSchema.model_validate(raw)
+    except ValidationError as e:
+        problems = []
+        for err in e.errors():
+            loc = ".".join(str(p) for p in err["loc"]) or "<root>"
+            msg = err["msg"]
+            problems.append(f"`{loc}`: {msg}")
+        coaching = (
+            "Your JSON didn't match the required schema. Fix these fields "
+            "and respond again with ONLY the corrected JSON:\n  - "
+            + "\n  - ".join(problems)
+        )
+        return None, coaching
+    out = model.model_dump()
+    # Preserve unknown keys the LLM volunteered — useful metadata, doesn't
+    # need to be in the schema. Skip private keys (start with _).
+    for k, v in raw.items():
+        if k not in out and not k.startswith("_"):
+            out[k] = v
+    return out, None
+
+
+def _dispatch_skill(skill_id: str, args: dict, ctx: SkillContext) -> dict:
+    """Run a skill and return a dict that ALWAYS carries an `_error_class`
+    field when something went wrong. The agent loop uses that field to
+    decide whether to coach the LLM (LLM's fault: bad args) or to record
+    a SKILL_BUG and consider auto-disabling the tool (our fault: skill
+    code threw)."""
+    from .error_classifier import classify_skill_error, ErrorClass
+
     skill = SKILL_REGISTRY.get(skill_id)
     if skill is None:
-        return {"error": f"unknown skill {skill_id}"}
+        # Treat unknown-skill as a config bug, not an LLM mistake — the
+        # LLM was advertised a tool that doesn't exist. Surface loudly.
+        return {"error": f"unknown skill {skill_id}",
+                "_error_class": ErrorClass.PROVIDER_CONFIG.value}
     try:
-        return skill.handler(ctx, **args)
-    except TypeError as e:
-        reliability.record_error(
-            "agent.dispatch_skill", e,
-            context={"skill_id": skill_id, "args": args, "reason": "bad_args"},
-        )
-        return {"error": f"bad args for {skill_id}: {e}"}
+        result = skill.handler(ctx, **args)
+        # Normalize: some skills return non-dicts (e.g. a float).
+        if not isinstance(result, dict):
+            return {"value": result}
+        return result
     except Exception as e:
+        cls = classify_skill_error(e)
         reliability.record_error(
             "agent.dispatch_skill", e,
-            context={"skill_id": skill_id, "args": args},
+            context={"skill_id": skill_id, "args": args,
+                     "error_class": cls.value},
+            kind=cls.value,
         )
-        return {"error": str(e)}
+        if cls == ErrorClass.LLM_TOOL_MISUSE:
+            # Coaching opportunity — surface a precise correction. Each
+            # skill can supply an `error_hint` with the EXACT calling
+            # convention (arg names, formats) so the LLM doesn't guess.
+            # Falls back to the generic schema reminder if the skill
+            # author hasn't written a hint yet.
+            hint = (getattr(skill, "error_hint", "") or "").strip()
+            if not hint:
+                hint = ("Re-check the tool schema and pass the correct "
+                        "argument names and types.")
+            return {"error": f"bad args for {skill_id}: {e}",
+                    "_error_class": cls.value,
+                    "_coaching": hint}
+        # SKILL_BUG or other: NOT the LLM's fault. Tell the LLM the tool
+        # is unavailable so it routes around it instead of trying to
+        # 'fix' a broken implementation. Auto-disable logic in the agent
+        # loop will remove the tool entirely after a threshold.
+        return {"error": f"tool {skill_id} is currently unavailable",
+                "_error_class": cls.value,
+                "_internal_message": str(e)}
 
 
 # ---------- The agent loop ----------
@@ -507,7 +746,9 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
     reflection_threshold = float(knobs["reflection_confidence_threshold"])
     reflection_max = int(knobs["reflection_max_cycles"])
     system_prompt = _compose_system_prompt(tool_skills, platform_cfg)
-    tool_specs = [s.to_openai_tool() for s in tool_skills]
+    # Tool specs are recomputed each step from the current disabled-skill
+    # set — if another proof in this parallel batch tripped auto-disable
+    # on a skill, this proof's NEXT step will also stop offering it.
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -518,7 +759,39 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
                     {"proof_index": proof_idx, "candidate_count": len(candidates),
                      "active_skills": [s.id for s in tool_skills]})
 
-    client = get_client(False)
+    # Build the LLM client ONCE per proof — test fixtures return a stub
+    # whose internal state advances across calls (script[0], script[1], …).
+    # Re-creating the client each step would reset that state and replay
+    # the first response forever.
+    _stub_client = get_client(False) if get_client is not chutes_client.get_client else None
+
+    # Adaptive max_tokens — starts at the comfortable default, ratchets up
+    # if a step's reasoning_content used most of the budget. Reasoning
+    # models on hard proofs can spend 2500+ tokens just thinking; without
+    # adapting we'd truncate the final JSON and force a parse_error nudge.
+    AGENT_MAX_TOKENS_DEFAULT = 3000
+    AGENT_MAX_TOKENS_CEILING = 5000
+    REASONING_HEAVY_THRESHOLD = 2000
+    next_max_tokens = AGENT_MAX_TOKENS_DEFAULT
+
+    # Trigger-based pruning — resolve once per proof (bank currency lookup
+    # is cheap but not free, and the candidate list is fixed for the run).
+    bank_ccy = _bank_currency(bank)
+    pruned_skills: list[tuple[str, str]] = []   # (skill_id, reason)
+    relevant_skills: list = []
+    for s in tool_skills:
+        ok, why = _skill_applies(s, proof, candidates, bank_ccy)
+        if ok:
+            relevant_skills.append(s)
+        else:
+            pruned_skills.append((s.id, why))
+    if pruned_skills:
+        db.append_trace(session_id, proof.get("source_file"), 0, "skills_pruned", {
+            "kept": [s.id for s in relevant_skills],
+            "pruned": [{"skill_id": sid, "reason": why}
+                       for sid, why in pruned_skills],
+        })
+
     step = 0
     tool_call_log: list[dict] = []
     reflection_cycles = 0
@@ -528,20 +801,63 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
     for _ in range(max_steps):
         step += 1
         t0 = time.perf_counter()
+        # Filter twice: (1) drop auto-disabled skills [persistent across
+        # sessions per tenant], (2) keep only trigger-applicable ones for
+        # THIS proof. Both filters narrow the tool spec section of the
+        # prompt; smaller prompt = less reasoning-token waste.
+        disabled = _disabled_skills_for(session_id)
+        active_skills = [s for s in relevant_skills if s.id not in disabled]
+        tool_specs = [s.to_openai_tool() for s in active_skills]
+        # Step-1 policy: force the model to use a tool instead of letting
+        # it deliberate ("should I call something or answer directly?").
+        # Our prompt explicitly tells it to start with recall_facts — but
+        # without `tool_choice="required"` reasoning models often just
+        # emit a JSON decision based on priors and we lose the grounding.
+        # On step 2+ we drop back to "auto" so it can return the final JSON.
+        if step == 1 and tool_specs:
+            step_tool_choice = "required"
+        elif tool_specs:
+            step_tool_choice = "auto"
+        else:
+            step_tool_choice = "none"
         try:
+            # Route through llm_router so a failing/slow provider trips its
+            # breaker and the next call automatically falls over to the
+            # fallback key (or OpenAI/Anthropic if configured). The router
+            # already wraps each provider in reliability.with_retry — don't
+            # double-wrap, or one slow call eats 30s × 3 × N providers.
             with _agent_llm_semaphore:
-                resp = reliability.with_retry(
-                    lambda: client.chat.completions.create(
-                        model=REASONING_MODEL,
-                        messages=messages,
+                if _stub_client is not None:
+                    # Test path — reuse the same stub client so its scripted
+                    # state advances across steps.
+                    resp = _stub_client.chat.completions.create(
+                        model=REASONING_MODEL, messages=messages,
                         tools=tool_specs,
-                        tool_choice="auto",
+                        tool_choice=step_tool_choice,
                         temperature=temperature,
-                        max_tokens=900,
-                        timeout=30,
-                    ),
-                    source="agent.run_one_proof",
-                )
+                        max_tokens=next_max_tokens, timeout=60,
+                    )
+                else:
+                    resp = chutes_client.chat(
+                        messages=messages, model=REASONING_MODEL,
+                        tools=tool_specs,
+                        tool_choice=step_tool_choice,
+                        temperature=temperature,
+                        # max_tokens is adaptive — starts at 3000, bumps
+                        # to 5000 if the previous step's reasoning_content
+                        # ate >2000 tokens (heavy-reasoning proof).
+                        max_tokens=next_max_tokens, timeout=60,
+                    )
+            # Record which provider actually answered this step. llm_router
+            # always populates last_provider() now that the agent goes through
+            # it, so the old "guess chutes_primary" fallback is dead code.
+            prov = llm_router.last_provider() or {}
+            db.append_trace(session_id, proof.get("source_file"), step,
+                            "provider", {
+                                "provider": prov.get("provider", "unknown"),
+                                "model": prov.get("model", REASONING_MODEL),
+                                "fallback_from": prov.get("fallback_from", []),
+                            })
         except Exception as e:
             latency = (time.perf_counter() - t0) * 1000
             db.append_trace(session_id, proof.get("source_file"), step, "error",
@@ -561,6 +877,22 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
         tokens_out = getattr(usage, "completion_tokens", 0) or 0
         details = getattr(usage, "prompt_tokens_details", None)
         tokens_cached = getattr(details, "cached_tokens", 0) or 0 if details else 0
+        # Chutes reasoning models report `reasoning_tokens` either at the
+        # top level of `usage` or under `completion_tokens_details`. Check
+        # both. If reasoning was heavy this step, bump next step's budget
+        # so the final-JSON has room.
+        reasoning_tokens = getattr(usage, "reasoning_tokens", 0) or 0
+        if not reasoning_tokens:
+            comp_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(comp_details, "reasoning_tokens", 0) or 0 if comp_details else 0
+        if reasoning_tokens >= REASONING_HEAVY_THRESHOLD and next_max_tokens < AGENT_MAX_TOKENS_CEILING:
+            new_budget = min(AGENT_MAX_TOKENS_CEILING, next_max_tokens + 1500)
+            db.append_trace(session_id, proof.get("source_file"), step,
+                            "max_tokens_bumped", {
+                                "reasoning_tokens": reasoning_tokens,
+                                "from": next_max_tokens, "to": new_budget,
+                            })
+            next_max_tokens = new_budget
         db.record_metric(session_id, proof_index=proof_idx, step=step,
                          tokens_in=tokens_in, tokens_out=tokens_out,
                          tokens_cached=tokens_cached, latency_ms=latency,
@@ -609,13 +941,59 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
                 )
                 db.append_trace(session_id, proof.get("source_file"), step,
                                 "tool_result", {"name": tc.function.name, "result": result})
+
+                # Auto-disable check — if the skill threw an internal bug
+                # (not a bad-args coaching opportunity), bump the per-session
+                # failure counter. When it crosses the threshold, drop the
+                # skill from this session's tool spec on subsequent steps
+                # so the LLM stops wasting reasoning tokens trying to use it.
+                err_class = result.get("_error_class") if isinstance(result, dict) else None
+                # Success path → reset the per-tenant failure counter for
+                # this skill (sliding-window recovery). LLM_TOOL_MISUSE
+                # doesn't count as success but also doesn't count as a
+                # skill bug — it's the LLM's fault, so leave the counter.
+                if err_class is None:
+                    try:
+                        db.record_skill_success(tc.function.name)
+                    except Exception:
+                        pass  # never let bookkeeping break the agent
+                if err_class == "skill_bug":
+                    err_msg = (result.get("_internal_message") or
+                               result.get("error") or "")
+                    n_fail = _record_skill_failure(
+                        session_id, tc.function.name, error=err_msg,
+                    )
+                    if n_fail >= _SKILL_AUTODISABLE_THRESHOLD:
+                        db.append_trace(session_id, proof.get("source_file"), step,
+                                        "skill_autodisabled", {
+                                            "skill_id": tc.function.name,
+                                            "failures": n_fail,
+                                            "threshold": _SKILL_AUTODISABLE_THRESHOLD,
+                                            "reason": "internal skill error (not LLM fault)",
+                                        })
+
                 messages.append({
                     "role": "tool", "tool_call_id": tc.id,
                     "content": db.safe_dumps(result),
                 })
             continue
 
-        final = _extract_final_json(msg.content)
+        # Use extract_content (not msg.content directly) so reasoning models
+        # that emit their final JSON inside `reasoning_content` instead of
+        # `content` still get parsed. The salvager finds the last balanced
+        # {...} block, which is where reasoning models tend to put the answer.
+        from .chutes_client import extract_content as _extract_content
+        final_text = _extract_content(resp)
+        final_raw = _extract_final_json(final_text)
+        schema_nudge = None
+        if final_raw is not None:
+            # Pydantic-validate + normalize the decision shape. If the LLM
+            # returned the right keys with wrong case / wrong types, this
+            # fixes them silently. If the shape is genuinely wrong, we get
+            # a coaching message naming the bad fields.
+            final, schema_nudge = _validate_decision(final_raw)
+        else:
+            final = None
         if final is not None:
             db.append_trace(session_id, proof.get("source_file"), step,
                             "decision", final)
@@ -652,14 +1030,31 @@ def _run_one_proof(proof: dict, candidates: list[dict], bank: str,
             if reflection_history:
                 final["reflection_history"] = reflection_history
             return final
+        # Differentiate the failure mode so the coaching message is honest:
+        # - empty `content` (reasoning ate the budget)
+        # - parseable JSON but failed schema validation (wrong field types)
+        # - unparseable JSON
+        # Misdiagnosing this is what used to lock the agent in a loop.
+        content_was_empty = not (msg.content or "").strip()
         db.append_trace(session_id, proof.get("source_file"), step, "parse_error",
-                        {"raw": (msg.content or "")[:500]})
-        messages.append({
-            "role": "user",
-            "content": "Your previous response wasn't valid JSON. Return ONLY the "
-                       "JSON object specified in the system prompt — no commentary, "
-                       "no code fences.",
-        })
+                        {"raw": (final_text or msg.content or "")[:500],
+                         "content_empty": content_was_empty,
+                         "schema_failure": bool(schema_nudge)})
+        if schema_nudge:
+            # JSON parsed fine but a field had wrong type / value. The
+            # schema_nudge lists exactly which fields and why — far more
+            # useful than a generic "respond with valid JSON" reminder.
+            nudge_msg = schema_nudge
+        elif content_was_empty:
+            nudge_msg = ("Your previous response was empty in `content` — the "
+                         "model spent its entire token budget on reasoning. "
+                         "Be MUCH more concise in your next response: skip "
+                         "explanatory text and emit ONLY the JSON object.")
+        else:
+            nudge_msg = ("Your previous response wasn't valid JSON. Return ONLY the "
+                         "JSON object specified in the system prompt — no commentary, "
+                         "no code fences.")
+        messages.append({"role": "user", "content": nudge_msg})
 
     db.append_trace(session_id, proof.get("source_file"), step, "exhausted",
                     {"max_steps": max_steps})
@@ -710,16 +1105,19 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
     unmatched_proofs: list[dict] = []
     classical_trace: list[str] = []
 
+    # ---- Phase 1: cheap pre-filter (no LLM) ----
+    # Bucket proofs into "skip" (unreadable / low-OCR / no candidates) and
+    # "to_run" (need the LLM). For to_run we compute candidates *without* the
+    # used_ids filter — used_ids is resolved sequentially in phase 3 after
+    # all LLM calls return, so parallel proofs see a stable candidate set.
+    to_run: list[tuple[int, dict, list[dict]]] = []  # (proof_idx, proof, candidates)
+    pre_skipped: dict[int, dict] = {}  # proof_idx -> classical_trace_line (decision handled here)
     for pi, proof in enumerate(proofs):
         src = proof.get("source_file", f"proof_{pi}")
         if proof.get("error") or not proof.get("amount") or not proof.get("currency"):
             unmatched_proofs.append({**proof, "reason": "Proof could not be parsed"})
-            classical_trace.append(f"SKIP {src} — unreadable")
+            pre_skipped[pi] = {"trace": f"SKIP {src} — unreadable"}
             continue
-
-        # OCR quality gate: low-completeness proofs never reach the LLM agent.
-        # The agent would spend tokens guessing missing fields and likely
-        # produce a wrong-confident match. Far better to surface for review.
         q = proof.get("ocr_quality") or {}
         if q.get("gate") == "low_quality":
             unmatched_proofs.append({
@@ -729,25 +1127,75 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
                            f"Needs human review."),
                 "needs_review": True,
             })
-            classical_trace.append(
+            pre_skipped[pi] = {"trace": (
                 f"SKIP {src} — ocr_quality={q.get('completeness')} "
                 f"(missing {q.get('missing_fields')})"
-            )
+            )}
             continue
-
-        candidates = _candidate_txns(proof, txns, used_ids)
+        candidates = _candidate_txns(proof, txns, set())  # no used_ids yet — parallel safe
         if not candidates:
             unmatched_proofs.append({**proof, "reason": "No bank transactions within date window"})
-            classical_trace.append(f"PROOF {src}: no candidates")
+            pre_skipped[pi] = {"trace": f"PROOF {src}: no candidates"}
             continue
+        to_run.append((pi, proof, candidates))
 
-        classical_trace.append(
-            f"PROOF {src}: {proof['amount']} {proof['currency']} on {proof.get('date','?')} "
-            f"({len(candidates)} candidates) — agent thinking…"
-        )
-        decision = _run_one_proof(proof, candidates, bank, sid, pi,
-                                  platform_cfg, tool_skills,
-                                  temperature=temperature, knobs=knobs)
+    # Emit pre-filter trace lines in proof order (deterministic output).
+    for pi in range(len(proofs)):
+        if pi in pre_skipped:
+            classical_trace.append(pre_skipped[pi]["trace"])
+        else:
+            # Find this proof's candidate count for the trace.
+            for tpi, tproof, tcands in to_run:
+                if tpi == pi:
+                    classical_trace.append(
+                        f"PROOF {tproof.get('source_file', f'proof_{pi}')}: "
+                        f"{tproof['amount']} {tproof['currency']} on "
+                        f"{tproof.get('date','?')} ({len(tcands)} candidates) — "
+                        f"agent thinking…"
+                    )
+                    break
+
+    # ---- Phase 2: parallel LLM runs ----
+    # ThreadPoolExecutor over the LLM-bound work. The per-call semaphore
+    # (`_agent_llm_semaphore`, cap=AGENT_LLM_CONCURRENCY) inside _run_one_proof
+    # caps how many in-flight LLM requests we actually issue, so a larger
+    # worker pool is fine — workers just wait on the semaphore.
+    decisions: dict[int, dict] = {}
+    if to_run:
+        max_workers = max(2, min(len(to_run), AGENT_LLM_CONCURRENCY * 2))
+        with ThreadPoolExecutor(max_workers=max_workers,
+                                thread_name_prefix="agent") as pool:
+            futures = {
+                pool.submit(_run_one_proof, proof, candidates, bank, sid, pi,
+                            platform_cfg, tool_skills,
+                            temperature=temperature, knobs=knobs): (pi, proof, candidates)
+                for pi, proof, candidates in to_run
+            }
+            for fut in as_completed(futures):
+                pi, proof, candidates = futures[fut]
+                try:
+                    decisions[pi] = fut.result()
+                except Exception as e:
+                    reliability.record_error(
+                        "agent.reconcile_agent.parallel", e,
+                        context={"session_id": sid, "proof_index": pi},
+                    )
+                    decisions[pi] = {"decision": "error", "error": str(e),
+                                     "fallback": True, "tool_calls": []}
+
+    # ---- Phase 3: sequential post-processing (in proof order) ----
+    # used_ids is resolved here. If two proofs picked the same txn the
+    # later-indexed proof loses it and falls through to no_match. This
+    # preserves the original semantics (earlier proofs win) while letting
+    # all LLM calls run concurrently.
+    for pi, proof in enumerate(proofs):
+        if pi in pre_skipped:
+            continue
+        decision = decisions.get(pi)
+        if decision is None:
+            continue
+        # Recompute candidate list for chosen-index lookup — same args as phase 1.
+        candidates = _candidate_txns(proof, txns, set())
 
         d = decision.get("decision")
         ti = decision.get("txn_index")
@@ -806,6 +1254,21 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
 
         prov = _build_provenance(decision, proof, chosen, bank)
         prov["verifier"] = verifier
+
+        # Parallel-mode conflict resolution — if an earlier proof already
+        # claimed this txn, demote this one to no_match. Earlier proofs win
+        # because phase 3 walks proofs in index order.
+        if chosen and chosen["id"] in used_ids:
+            unmatched_proofs.append({
+                **proof,
+                "reason": (f"Agent chose txn {chosen['id']} but it was already "
+                           f"matched to an earlier proof."),
+                "agent_tool_calls": decision.get("tool_calls", []),
+            })
+            classical_trace.append(
+                f"  [X] AGENT CONFLICT — txn {chosen['id']} already taken"
+            )
+            continue
 
         if d == "strict" and chosen:
             raw_conf = float(decision.get("confidence") or 0.95)
@@ -871,6 +1334,11 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
     unmatched_txns = [t for t in txns if t["id"] not in used_ids
                       and not any(s["txn"]["id"] == t["id"] for s in soft_matches)]
 
+    # Snapshot auto-disable state for this session, then clear the bucket
+    # so the in-memory map doesn't grow forever.
+    disabled_final = sorted(_disabled_skills_for(sid))
+    _clear_session_skill_failures(sid)
+
     result = {
         "matches": matches,
         "soft_matches": soft_matches,
@@ -888,6 +1356,7 @@ def reconcile_agent(proofs: list[dict], txns: list[dict], bank: str,
         "agent_trace": db.get_trace(sid),
         "mode": "agent",
         "active_skills": [s.id for s in tool_skills],
+        "auto_disabled_skills": disabled_final,
         "prompt_versions": platform_config.active_prompt_versions(platform_cfg),
     }
     db.save_session(sid, bank, result)

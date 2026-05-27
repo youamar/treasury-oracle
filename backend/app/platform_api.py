@@ -177,6 +177,10 @@ def update_skill(skill_id: str, body: SkillUpdate):
 class WizardRequest(BaseModel):
     business_profile: str
     apply: bool = True  # if false, return proposed config without saving
+    # When apply=true and the caller already has a proposed config from a
+    # prior apply=false round-trip, pass it here to skip the LLM call and
+    # save directly. Avoids a second 30s Chutes round-trip on Accept.
+    proposed: dict | None = None
 
 
 _WIZARD_SYSTEM = """You configure a treasury-reconciliation skill platform.
@@ -184,8 +188,14 @@ You will be given a description of the customer's business, a catalog of
 available skills (id, name, kind, default purpose), and the current default
 system_prompt for each.
 
-Return STRICT JSON only (no commentary, no code fences) in this shape:
+OUTPUT FORMAT — read this carefully:
+- Your ENTIRE response is a single JSON object and nothing else.
+- The first character of your response MUST be `{`.
+- Do NOT write "Thinking Process:", "Here is the config:", or any preamble.
+- Do NOT wrap the JSON in ```json ... ``` code fences.
+- Do NOT add any commentary before or after the JSON.
 
+JSON shape:
 {
   "enabled_skills": ["<skill_id>", ...],
   "skill_overrides": {
@@ -194,7 +204,7 @@ Return STRICT JSON only (no commentary, no code fences) in this shape:
   "rationale": "<2-3 sentence summary of choices>"
 }
 
-Rules:
+Rules for the content of the JSON:
 - Only enable skills that genuinely fit the customer's needs. It is fine to
   disable capabilities the customer will not use.
 - Only override a system_prompt when the customer's profile demands a real
@@ -206,6 +216,27 @@ Rules:
 @router.post("/wizard")
 def wizard(body: WizardRequest):
     cur = platform_config.load_config()
+
+    # Fast path: caller passed a pre-proposed config and just wants to save.
+    if body.apply and body.proposed:
+        valid_ids = {s.id for s in all_skills()}
+        proposed = dict(body.proposed)
+        proposed["enabled_skills"] = sorted(
+            sid for sid in (proposed.get("enabled_skills") or []) if sid in valid_ids
+        )
+        proposed["skill_overrides"] = {
+            sid: ov for sid, ov in (proposed.get("skill_overrides") or {}).items()
+            if sid in valid_ids
+        }
+        new_cfg = {
+            **cur,
+            "enabled_skills": proposed["enabled_skills"],
+            "skill_overrides": proposed["skill_overrides"],
+            "business_profile": body.business_profile,
+        }
+        saved = platform_config.save_config(new_cfg)
+        return {"applied": True, "config": saved, "rationale": proposed.get("rationale", "")}
+
     catalog = []
     for s in all_skills():
         catalog.append({
@@ -219,33 +250,49 @@ def wizard(body: WizardRequest):
         f"CURRENT CONFIG:\n{json.dumps(cur, ensure_ascii=False, indent=2)}"
     )
 
-    client = get_client(False)
+    # Route through chutes_client.chat (not the raw OpenAI client) so the
+    # call gets multi-provider failover, breaker integration, and the
+    # ONE_SHOT_POLICY (single attempt, no 3x retry on a slow reasoning
+    # model). max_tokens raised because the wizard's structured-config
+    # output is large + reasoning models burn 500-1000 tokens thinking;
+    # at 1500 the JSON was being truncated mid-output -> parse error.
+    from .chutes_client import chat as llm_chat
+    from .reliability import ONE_SHOT_POLICY
     try:
-        resp = client.chat.completions.create(
-            model=REASONING_MODEL,
+        resp = llm_chat(
             messages=[
                 {"role": "system", "content": _WIZARD_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
+            model=REASONING_MODEL,
             temperature=0.2,
-            max_tokens=1500,
-            timeout=45,
+            max_tokens=4000,
+            timeout=90,
+            response_format={"type": "json_object"},
+            retry_policy=ONE_SHOT_POLICY,
         )
     except Exception as e:
         raise HTTPException(502, f"wizard LLM call failed: {e}")
 
-    raw = (resp.choices[0].message.content or "").strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        if len(parts) >= 2:
-            inner = parts[1]
-            if inner.startswith("json"):
-                inner = inner[4:]
-            raw = inner.strip()
+    from .chutes_client import extract_content, strip_code_fences, _last_json_block
+    raw = strip_code_fences(extract_content(resp))
     try:
         proposed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise HTTPException(502, f"wizard returned invalid JSON: {e}; raw={raw[:300]}")
+    except json.JSONDecodeError:
+        # Reasoning models sometimes ignore the "JSON only" instruction and
+        # emit a preamble ("Thinking Process: ... Here is the config: {...}").
+        # Salvage by extracting the LAST balanced {...} block, which is
+        # where the actual answer lands when the model thinks out loud.
+        salvaged = _last_json_block(raw)
+        if salvaged:
+            try:
+                proposed = json.loads(salvaged)
+            except json.JSONDecodeError as e:
+                raise HTTPException(502,
+                    f"wizard returned invalid JSON even after salvage: {e}; raw={raw[:300]}")
+        else:
+            raise HTTPException(502,
+                f"wizard returned no JSON object; raw={raw[:300]}")
 
     valid_ids = {s.id for s in all_skills()}
     proposed["enabled_skills"] = sorted(

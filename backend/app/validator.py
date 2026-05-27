@@ -1,7 +1,8 @@
 """Sales submission validator — refuses sloppy proofs with a sassy LLM critique."""
 import json
-from .chutes_client import chat
+from .chutes_client import chat, extract_content, strip_code_fences
 from .config import REASONING_MODEL
+from .reliability import ONE_SHOT_POLICY
 
 CRITIQUE_PROMPT = """You are a no-nonsense finance compliance bot. A salesperson just
 submitted a payment proof. Audit its quality.
@@ -45,14 +46,12 @@ def validate_submission(proof: dict) -> dict:
     try:
         resp = chat(
             messages=[{"role": "user", "content": prompt}],
-            model=REASONING_MODEL, temperature=0.4, max_tokens=300,
+            model=REASONING_MODEL, temperature=0.4, max_tokens=1200,
             response_format={"type": "json_object"},
+            timeout=60, retry_policy=ONE_SHOT_POLICY,
         )
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"): raw = raw[4:]
-            raw = raw.strip()
+        raw = extract_content(resp).strip()
+        raw = strip_code_fences(raw)
         return json.loads(raw)
     except Exception:
         if obvious_fail:

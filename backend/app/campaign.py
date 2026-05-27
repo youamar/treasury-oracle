@@ -2,8 +2,9 @@
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from .chutes_client import chat
+from .chutes_client import chat, extract_content, strip_code_fences
 from .config import REASONING_MODEL
+from .reliability import ONE_SHOT_POLICY
 from .dunning import LANG_MAP
 from . import db
 
@@ -48,14 +49,12 @@ def _draft_stage(stage_idx: int, campaign: dict) -> dict:
     try:
         resp = chat(
             messages=[{"role": "user", "content": prompt}],
-            model=REASONING_MODEL, temperature=0.5, max_tokens=400,
+            model=REASONING_MODEL, temperature=0.5, max_tokens=1500,
             response_format={"type": "json_object"},
+            timeout=60, retry_policy=ONE_SHOT_POLICY,
         )
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"): raw = raw[4:]
-            raw = raw.strip()
+        raw = extract_content(resp).strip()
+        raw = strip_code_fences(raw)
         d = json.loads(raw)
     except Exception:
         d = {"subject": f"{stage['subject_hint']} — {campaign['invoice_ref']}",

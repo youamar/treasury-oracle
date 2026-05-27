@@ -35,4 +35,17 @@ SKILL = register(SkillDef(
     },
     category="reconciliation",
     tags=("fees", "agent-tool"),
+    examples=[{
+        "args": {"amount": 4720.0, "bank_name": "Maybank"},
+        "result": {"bank": "Maybank", "fee_pct": 0.005, "fee_amount": 23.6,
+                   "net_amount": 4696.4, "source": "db:banks/Maybank"},
+        "when": "compute net after applying Maybank's 0.5% inbound conversion fee",
+    }],
+    error_hint=(
+        "apply_bank_fee takes (amount: number, bank_name: string). "
+        "amount is the GROSS local-currency value AFTER fx conversion "
+        "(not the proof's foreign-currency amount). bank_name must match "
+        "the destination bank id from the run config — pass 'default' if "
+        "unsure rather than inventing a name."
+    ),
 ))

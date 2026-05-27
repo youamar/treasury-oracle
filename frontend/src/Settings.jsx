@@ -141,6 +141,75 @@ function BanksEditor() {
 }
 
 
+function ProvidersPanel() {
+  const [chain, setChain] = useState([]);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    setBusy(true);
+    try {
+      const r = await fetch(`${API}/providers`);
+      if (r.ok) setChain((await r.json()).chain || []);
+    } finally { setBusy(false); }
+  }
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 8000);
+    return () => clearInterval(t);
+  }, []);
+
+  const stateColor = (s) => s === "open" ? "red" : s === "half_open" ? "amber" : "green";
+  const stateLabel = (s) => s === "open" ? "tripped" : s === "half_open" ? "probing" : "healthy";
+
+  return (
+    <Card
+      title="🧠 LLM Providers"
+      subtitle="Failover chain. If the top provider trips its circuit breaker, the agent automatically falls through to the next one — narrative, dunning, and OCR keep working even when Chutes is down."
+      actions={
+        <button onClick={load} disabled={busy}
+                className="text-xs px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 disabled:opacity-50">
+          {busy ? "refreshing…" : "refresh"}
+        </button>
+      }
+    >
+      {chain.length === 0 ? (
+        <EmptyState>
+          No providers configured. Set <code>CHUTES_API_KEY</code>, <code>OPENAI_API_KEY</code>, or <code>ANTHROPIC_API_KEY</code> in <code>.env</code>.
+        </EmptyState>
+      ) : (
+        <ol className="space-y-2">
+          {chain.map((p, i) => (
+            <li key={p.name} className="flex items-center justify-between gap-3 p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="font-mono text-xs text-slate-400 w-6">#{i + 1}</div>
+                <div className="min-w-0">
+                  <div className="font-semibold text-slate-900 dark:text-slate-100">{p.name}</div>
+                  {p.last_error && (
+                    <div className="text-[11px] text-red-600 dark:text-red-400 truncate font-mono" title={p.last_error}>
+                      last error: {p.last_error}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Badge color={stateColor(p.breaker_state)}>{stateLabel(p.breaker_state)}</Badge>
+                {p.failures > 0 && <Badge color="amber">{p.failures} fail</Badge>}
+                {p.remaining_cooldown_seconds > 0 && (
+                  <span className="text-[11px] text-slate-500">cools in {Math.round(p.remaining_cooldown_seconds)}s</span>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+      <div className="mt-3 text-[11px] text-slate-500 dark:text-slate-400">
+        Order is left-to-right: the agent tries provider #1 first, then falls through. Reorder by setting <code>LLM_PROVIDER_CHAIN</code>.
+      </div>
+    </Card>
+  );
+}
+
+
 export default function Settings() {
   const [skills, setSkills] = useState([]);
   const [config, setConfig] = useState(null);
@@ -582,6 +651,9 @@ export default function Settings() {
           ))
         )}
       </Card>
+
+      {/* LLM Providers */}
+      <ProvidersPanel />
 
       {/* Banks */}
       <BanksEditor />

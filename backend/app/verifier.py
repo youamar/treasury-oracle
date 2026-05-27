@@ -75,16 +75,8 @@ def _build_user_prompt(decision: dict, proof: dict, chosen: dict, bank: str) -> 
 
 
 def _strip_fences(text: str) -> str:
-    t = (text or "").strip()
-    if not t.startswith("```"):
-        return t
-    parts = t.split("```")
-    if len(parts) < 2:
-        return t
-    inner = parts[1]
-    if inner.startswith("json"):
-        inner = inner[4:]
-    return inner.strip()
+    from .chutes_client import strip_code_fences
+    return strip_code_fences(text)
 
 
 def llm_verify(decision: dict, proof: dict, chosen: dict, bank: str,

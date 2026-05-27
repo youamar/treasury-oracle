@@ -40,4 +40,22 @@ SKILL = register(SkillDef(
     },
     category="reconciliation",
     tags=("fx", "agent-tool"),
+    examples=[{
+        "args": {"from_ccy": "USD", "to_ccy": "MYR", "date": "2026-05-20"},
+        "result": {"rate": 4.72, "source": "ecb_live", "trusted": True,
+                   "asof": "2026-05-20"},
+        "when": "convert a USD invoice on its value date to the MYR account",
+    }],
+    error_hint=(
+        "get_fx_rate takes three string args: from_ccy, to_ccy, date. "
+        "Currencies are ISO 4217 (3 letters, uppercase, e.g. 'USD', 'MYR'). "
+        "date is the proof's value date in 'YYYY-MM-DD' format — never use "
+        "today's date or natural-language dates like 'yesterday'."
+    ),
+    triggers={
+        # FX lookups are pointless when the proof is already in the bank's
+        # local currency. Pruning these saves ~150 tokens from the prompt
+        # AND removes a tempting wrong tool the LLM might call out of habit.
+        "cross_currency_only": True,
+    },
 ))

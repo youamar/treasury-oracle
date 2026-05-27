@@ -1,7 +1,8 @@
 """Boss documentary mode — epic 3-paragraph macro narrative for FX shortfalls."""
 import json
-from .chutes_client import chat
+from .chutes_client import chat, extract_content, strip_code_fences
 from .config import REASONING_MODEL
+from .reliability import ONE_SHOT_POLICY
 
 
 DOC_PROMPT = """You are writing the voice-over script for a 60-second corporate documentary
@@ -39,14 +40,12 @@ def documentary_narrative(amount, from_ccy, to_ccy, invoice_date, payment_date,
     try:
         resp = chat(
             messages=[{"role": "user", "content": prompt}],
-            model=REASONING_MODEL, temperature=0.7, max_tokens=700,
+            model=REASONING_MODEL, temperature=0.7, max_tokens=2000,
             response_format={"type": "json_object"},
+            timeout=60, retry_policy=ONE_SHOT_POLICY,
         )
-        raw = resp.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"): raw = raw[4:]
-            raw = raw.strip()
+        raw = extract_content(resp).strip()
+        raw = strip_code_fences(raw)
         d = json.loads(raw)
     except Exception:
         d = {

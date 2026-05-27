@@ -42,4 +42,24 @@ SKILL = register(SkillDef(
     category="reconciliation",
     tags=("matching", "agent-tool"),
     model_profile="cheap",
+    examples=[{
+        "args": {"proof_index": 0, "txn_index": 2},
+        "result": {"score": 0.85, "signals": ["payer:exact", "ref:contained"],
+                   "matched_alias": None},
+        "when": "verify that candidate [2] really refers to the same payer as the proof",
+    }],
+    error_hint=(
+        "fuzzy_compare takes two integers: proof_index and txn_index. "
+        "These are positional indexes into the CURRENT batch — proof_index "
+        "is always 0 unless you're explicitly batch-comparing, and "
+        "txn_index must be in 0..N-1 where N is the candidate count "
+        "shown in the user prompt. Do not pass payer names or invoice "
+        "refs here — pass the INTEGER index."
+    ),
+    triggers={
+        # No candidates → no comparison possible. Pruning avoids the LLM
+        # calling fuzzy_compare with txn_index=0 on an empty candidate list
+        # and then having to interpret the "out of range" error.
+        "requires_candidates": True,
+    },
 ))

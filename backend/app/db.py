@@ -331,6 +331,22 @@ CREATE TABLE IF NOT EXISTS breaker_states (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS skill_health (
+    -- Per-tenant skill failure tracking with sliding-window auto-disable.
+    -- Promoted from the in-memory dict so a skill that's broken for one
+    -- tenant doesn't waste agent tokens on every reconcile run.
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    skill_id  TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_failure_at TEXT,
+    -- ISO timestamp; when present and in the future, the skill is dropped
+    -- from agent tool specs. Operator can manually reset via the API.
+    disabled_until TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, skill_id)
+);
+
 CREATE TABLE IF NOT EXISTS banks (
     -- Per-tenant bank registry. Pre-seeded with the historical BANK_FEES
     -- dict on first boot per tenant; customers can edit / add / delete.
@@ -464,13 +480,16 @@ def init_db(path: Path | None = None):
                 ("default", "Default Tenant", _now()),
             )
             c.commit()
+        # Mark initialized before calling into auth — auth.init_auth_schema uses
+        # db.conn(), which re-enters init_db() if _initialized is still False,
+        # deadlocking on _init_lock (non-reentrant).
+        _initialized = True
         # Auth schema lives in a sibling module to keep its concerns isolated.
         try:
             from . import auth as _auth
             _auth.init_auth_schema()
         except Exception:
             pass
-        _initialized = True
         # If callers switched DB_PATH (tests do this), drop pooled connections
         # so the next conn() opens against the new file.
         reset_pool()
@@ -733,13 +752,27 @@ def promote_soft_match(soft_match_id: int) -> dict | None:
 
 def append_trace(session_id: str, proof_source: str | None, step: int,
                  type_: str, payload: dict):
+    now = _now()
     with conn() as c:
         c.execute(
             "INSERT INTO agent_trace(session_id, proof_source, step, type, "
             "payload_json, created_at, tenant_id) VALUES (?,?,?,?,?,?,?)",
             (session_id, proof_source, step, type_, json.dumps(payload),
-             _now(), _t()),
+             now, _t()),
         )
+    # Live broadcast — SSE subscribers get the same event in real time.
+    # Done after DB commit so persistence is the source of truth; if the
+    # process dies between the two, the DB still has the event.
+    try:
+        from . import trace_stream
+        trace_stream.publish(session_id, {
+            "type": type_, "step": step, "proof_source": proof_source,
+            "payload": payload, "at": now,
+        })
+    except Exception:
+        # Live stream is best-effort — never break the agent over a
+        # subscriber bug.
+        pass
 
 
 def get_trace(session_id: str) -> list[dict]:
@@ -1406,6 +1439,99 @@ def delete_breaker_state(source: str | None = None) -> None:
             c.execute("DELETE FROM breaker_states")
         else:
             c.execute("DELETE FROM breaker_states WHERE source = ?", (source,))
+
+
+# ---------- skill_health (per-tenant auto-disable for buggy skills) ----------
+
+SKILL_DISABLE_HOURS = 24  # how long a tripped skill stays disabled
+
+
+def record_skill_failure(skill_id: str, threshold: int, error: str = "") -> dict:
+    """Bump the consecutive-failure counter for (current_tenant, skill_id).
+    If the counter crosses `threshold`, set `disabled_until = now + 24h`.
+    Returns the updated row. Caller doesn't need to read it back unless it
+    wants to surface the disable event in a trace."""
+    tid = _t()
+    now = _now()
+    with conn() as c:
+        cur = c.execute(
+            "SELECT consecutive_failures FROM skill_health "
+            "WHERE tenant_id = ? AND skill_id = ?", (tid, skill_id)
+        ).fetchone()
+        prior = (cur["consecutive_failures"] if cur else 0)
+        new_count = prior + 1
+        disabled_until = None
+        if new_count >= threshold:
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            disabled_until = (_dt.now(_tz.utc) + _td(hours=SKILL_DISABLE_HOURS)).isoformat()
+        c.execute(
+            "INSERT INTO skill_health(tenant_id, skill_id, consecutive_failures, "
+            "last_failure_at, disabled_until, last_error, updated_at) "
+            "VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(tenant_id, skill_id) DO UPDATE SET "
+            "consecutive_failures = excluded.consecutive_failures, "
+            "last_failure_at = excluded.last_failure_at, "
+            "disabled_until = COALESCE(excluded.disabled_until, skill_health.disabled_until), "
+            "last_error = excluded.last_error, "
+            "updated_at = excluded.updated_at",
+            (tid, skill_id, new_count, now, disabled_until,
+             (error or "")[:300], now),
+        )
+    return {"skill_id": skill_id, "consecutive_failures": new_count,
+            "disabled_until": disabled_until}
+
+
+def record_skill_success(skill_id: str) -> None:
+    """Reset the consecutive-failure counter on a successful call.
+    Does NOT clear `disabled_until` — that requires an explicit operator
+    re-enable so we don't auto-re-enable a flaky skill after one good run."""
+    tid = _t()
+    now = _now()
+    with conn() as c:
+        c.execute(
+            "INSERT INTO skill_health(tenant_id, skill_id, consecutive_failures, "
+            "updated_at) VALUES (?,?,0,?) "
+            "ON CONFLICT(tenant_id, skill_id) DO UPDATE SET "
+            "consecutive_failures = 0, updated_at = excluded.updated_at",
+            (tid, skill_id, now),
+        )
+
+
+def list_disabled_skills() -> set[str]:
+    """Skills currently disabled for the current tenant (disabled_until > now)."""
+    tid = _t()
+    now = _now()
+    with conn() as c:
+        rows = c.execute(
+            "SELECT skill_id FROM skill_health "
+            "WHERE tenant_id = ? AND disabled_until IS NOT NULL "
+            "AND disabled_until > ?", (tid, now)
+        ).fetchall()
+    return {r["skill_id"] for r in rows}
+
+
+def list_skill_health() -> list[dict]:
+    """All skill_health rows for the current tenant, for the operator UI."""
+    tid = _t()
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT skill_id, consecutive_failures, last_failure_at, "
+            "disabled_until, last_error, updated_at FROM skill_health "
+            "WHERE tenant_id = ? ORDER BY updated_at DESC", (tid,)
+        )]
+
+
+def reenable_skill(skill_id: str) -> None:
+    """Operator action — clear disabled_until + reset counter so the skill
+    is offered to the agent again on the next run."""
+    tid = _t()
+    now = _now()
+    with conn() as c:
+        c.execute(
+            "UPDATE skill_health SET disabled_until = NULL, "
+            "consecutive_failures = 0, updated_at = ? "
+            "WHERE tenant_id = ? AND skill_id = ?", (now, tid, skill_id)
+        )
 
 
 # ---------- banks (per-tenant editable BANK_FEES + tolerance) ----------

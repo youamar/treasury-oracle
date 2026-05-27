@@ -6,7 +6,7 @@ import io
 import os
 from typing import Optional
 from PIL import Image
-from .chutes_client import chat
+from .chutes_client import chat, extract_content, strip_code_fences
 from .config import VISION_MODEL
 
 
@@ -112,13 +112,7 @@ def extract_payment_proof(image_bytes: bytes, filename: str = "") -> dict:
         max_tokens=600,
         response_format={"type": "json_object"},
     )
-    raw = resp.choices[0].message.content.strip()
-    # Strip code fences if model wraps response
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    raw = strip_code_fences(extract_content(resp))
 
     try:
         data = json.loads(raw)

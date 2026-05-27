@@ -41,17 +41,11 @@ def _status_code(exc: BaseException) -> int | None:
 
 
 def is_retryable(exc: BaseException) -> bool:
-    name = type(exc).__name__.lower()
-    if any(k in name for k in ("timeout", "connection", "readtimeout")):
-        return True
-    sc = _status_code(exc)
-    if sc in _RETRYABLE_STATUS:
-        return True
-    # Heuristic: OpenAI SDK wraps with classes like RateLimitError, APIConnectionError
-    if any(k in name for k in ("ratelimit", "apiconnection", "apitimeout",
-                               "serviceunavailable", "internalserver")):
-        return True
-    return False
+    """Delegate to the central error classifier. An exception is "retryable
+    on the same provider" only if the class says so — auth and config
+    failures are explicitly NOT retryable, even if they look 4xx-ish."""
+    from .error_classifier import classify_provider_error, policy_for
+    return policy_for(classify_provider_error(exc)).retry_same_provider
 
 
 def is_auth_error(exc: BaseException) -> bool:
@@ -88,6 +82,21 @@ class RetryPolicy:
 
 
 DEFAULT_POLICY = RetryPolicy()
+
+# Single-attempt policy for one-shot user-facing LLM calls (dunning,
+# narrative, validator…). These hit reasoning models that take 20-40s
+# per call; three blind retries on timeout = 90-180s of stalling per
+# provider before the router moves on. Caller wants to know NOW if the
+# request failed, so they can show a useful error instead of pretending
+# to still be working.
+ONE_SHOT_POLICY = RetryPolicy(max_attempts=1)
+
+# Two-attempt policy for user-facing reasoning-model calls. One retry gives
+# the Chutes pool a chance to route to a DIFFERENT model on the second try
+# — if the first one was slow, the pool's `:latency` alias usually picks a
+# faster one. Worst case 2× timeout, typical case unchanged (first wins).
+# Trade-off vs ONE_SHOT: longer worst-case wait, much higher success rate.
+TWO_SHOT_POLICY = RetryPolicy(max_attempts=2, base_delay=0.25, max_delay=2.0)
 
 
 # ---------- circuit breaker ----------

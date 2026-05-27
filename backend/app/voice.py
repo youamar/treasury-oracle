@@ -77,25 +77,24 @@ def extract_from_transcript(transcript: str, source: str = "voice_note") -> dict
 
     prompt = VOICE_PARSE_PROMPT.format(transcript=transcript[:4000])
     try:
+        from .reliability import ONE_SHOT_POLICY
         resp = chat(
             messages=[{"role": "user", "content": prompt}],
             model=REASONING_MODEL,
             temperature=0.1,
-            max_tokens=500,
+            # Reasoning headroom + explicit timeout so a stuck voice-note
+            # upload can't hang the ingest pipeline indefinitely.
+            max_tokens=2000,
             response_format={"type": "json_object"},
+            timeout=60,
+            retry_policy=ONE_SHOT_POLICY,
         )
     except Exception as e:
         return {"error": f"LLM call failed: {type(e).__name__}: {e}",
                 "source_file": source, "transcript": transcript}
 
-    raw = (resp.choices[0].message.content or "").strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        if len(parts) >= 2:
-            inner = parts[1]
-            if inner.startswith("json"):
-                inner = inner[4:]
-            raw = inner.strip()
+    from .chutes_client import extract_content, strip_code_fences
+    raw = strip_code_fences(extract_content(resp))
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:

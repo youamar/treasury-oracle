@@ -1,10 +1,21 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { apiFetch as fetch, pushToast } from "./Toast.jsx";
 
 export default function DunningModal({ proof, expected, actual, localCcy, onClose }) {
   const [email, setEmail] = useState(null);
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
+  // Elapsed-seconds counter while the LLM is drafting. Reasoning models
+  // take 20-40s per email — without a visible counter the user assumes
+  // the button is stuck.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!loading) return;
+    setElapsed(0);
+    const startedAt = Date.now();
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [loading]);
 
   async function draft() {
     setLoading(true);
@@ -76,7 +87,9 @@ export default function DunningModal({ proof, expected, actual, localCcy, onClos
         {!email ? (
           <button onClick={draft} disabled={loading}
                   className="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed">
-            {loading ? "Drafting in payer's language..." : "✍️ Draft email with AI"}
+            {loading
+              ? `Drafting in payer's language… (${elapsed}s — reasoning model, normally 20–40s)`
+              : "✍️ Draft email with AI"}
           </button>
         ) : (
           <>
@@ -93,9 +106,10 @@ export default function DunningModal({ proof, expected, actual, localCcy, onClos
                         className="bg-emerald-600 text-white px-4 py-2 rounded hover:bg-emerald-700">
                   Send
                 </button>
-                <button onClick={() => setEmail(null)}
-                        className="bg-slate-200 px-4 py-2 rounded hover:bg-slate-300">
-                  Regenerate
+                <button onClick={() => { setEmail(null); draft(); }}
+                        disabled={loading}
+                        className="bg-slate-200 px-4 py-2 rounded hover:bg-slate-300 disabled:opacity-50">
+                  {loading ? `Regenerating… (${elapsed}s)` : "Regenerate"}
                 </button>
               </div>
             )}

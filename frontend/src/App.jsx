@@ -13,7 +13,8 @@ import SalesValidator from "./SalesValidator.jsx";
 import Settings from "./Settings.jsx";
 import MemoryPanel from "./MemoryPanel.jsx";
 import EvalPanel from "./EvalPanel.jsx";
-import { apiFetch as fetch, pushToast } from "./Toast.jsx";
+import History from "./History.jsx";
+import { apiFetch as fetch, pushToast, downloadAuthed } from "./Toast.jsx";
 import { SAMPLE_PROOFS, SAMPLE_TXNS, SAMPLE_PARSE_INFO } from "./sampleData.js";
 import Account, { getTenant, getEmail, isOnboarded, signOut, onAccountChange } from "./Account.jsx";
 import Onboarding from "./Onboarding.jsx";
@@ -145,6 +146,26 @@ function Workspace() {
   const [banks, setBanks] = useState([]);  // loaded from /api/banks per tenant
   const [busy, setBusy] = useState("");
   const [liveTrace, setLiveTrace] = useState([]);  // streaming agent events while busy
+  // Progress state. The old single bar jumped 0→100% because all proofs
+  // finish near-simultaneously (parallel agent). The new shape tracks
+  // PER-PROOF step counts + global activity counters so the user can see
+  // ongoing work even when no proof has decided yet.
+  const [progress, setProgress] = useState({
+    expectedProofs: 0,
+    startedAt: 0,
+    elapsedMs: 0,
+    perProof: {},   // proof_source -> { step, decided, toolCalls, lastEvent }
+    llmCalls: 0,    // count of `provider` events (one per LLM round-trip)
+    toolCalls: 0,   // count of `tool_call` events
+  });
+  // Tick every second while busy so the elapsed counter updates.
+  useEffect(() => {
+    if (!busy || !progress.startedAt) return;
+    const t = setInterval(() => {
+      setProgress(p => ({ ...p, elapsedMs: Date.now() - p.startedAt }));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [busy, progress.startedAt]);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [narrative, setNarrative] = useState(null);
   const [narrativeBusy, setNarrativeBusy] = useState(false);
@@ -248,30 +269,63 @@ function Workspace() {
     if (!proofs.length || !txns.length) return;
     setBusy("Agent starting...");
     setLiveTrace([]);
+    setProgress({
+      expectedProofs: proofs.length,
+      startedAt: Date.now(), elapsedMs: 0,
+      perProof: {},
+      llmCalls: 0, toolCalls: 0,
+    });
     // Stable idempotency key for THIS set of inputs — a tab refresh that
     // re-submits the same proofs+txns will hit the cached recon_id instead
     // of spending tokens again.
     const idempKey = "recon-" + await sha256Short(
       JSON.stringify({ bank, proofs, txns })
     );
-    // Client-generated session id so we can poll trace while the agent runs.
+    // Client-generated session id so we can subscribe to SSE BEFORE the
+    // POST starts emitting trace events.
     const liveSid = "live-" + Math.random().toString(36).slice(2, 10);
-    let polling = true;
-    (async () => {
-      while (polling) {
-        await new Promise(r => setTimeout(r, 800));
-        if (!polling) break;
-        try {
-          const tr = await fetch(`${API}/session/${liveSid}/trace`).then(r => r.json());
-          setLiveTrace(tr.trace || []);
-          if (tr.trace?.length) {
-            const last = tr.trace[tr.trace.length - 1];
-            setBusy(`Agent step ${last.step} — ${last.type}${
-              last.payload?.name ? `: ${last.payload.name}` : ""}`);
-          }
-        } catch {}
+
+    // ---- live trace via SSE (replaces the old polling loop) -----------
+    // Each event arrives the moment db.append_trace runs server-side.
+    // Per-proof state: every event with a proof_source updates that proof's
+    // last-step + activity counts so the UI shows ongoing work even before
+    // any proof has decided.
+    const es = new EventSource(`${API}/session/${liveSid}/events`);
+    es.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "session_complete") {
+        es.close();
+        return;
       }
-    })();
+      setLiveTrace(prev => [...prev, msg]);
+      setBusy(`${msg.type}${msg.payload?.name ? `: ${msg.payload.name}` : ""}`);
+      setProgress(p => {
+        const next = {
+          ...p,
+          llmCalls: p.llmCalls + (msg.type === "provider" ? 1 : 0),
+          toolCalls: p.toolCalls + (msg.type === "tool_call" ? 1 : 0),
+        };
+        const src = msg.proof_source;
+        if (src) {
+          const cur = p.perProof[src] || { step: 0, decided: false, toolCalls: 0 };
+          next.perProof = {
+            ...p.perProof,
+            [src]: {
+              step: Math.max(cur.step, msg.step || 0),
+              decided: cur.decided || msg.type === "decision",
+              toolCalls: cur.toolCalls + (msg.type === "tool_call" ? 1 : 0),
+              lastEvent: msg.type,
+            },
+          };
+        }
+        return next;
+      });
+    };
+    es.onerror = () => {
+      // SSE auto-reconnects; suppress noisy logs. If the POST completes
+      // before SSE reconnects we'll still get the final result.
+    };
     try {
       const r = await fetch(`${API}/reconcile`, {
         method: "POST",
@@ -298,8 +352,9 @@ function Workspace() {
     } catch (e) {
       pushToast({ kind: "error", title: "Reconcile failed", message: String(e) });
     }
-    polling = false;
+    try { es.close(); } catch {}
     setBusy("");
+    setProgress(p => ({ ...p, startedAt: 0 }));
   }
 
   async function loadNarrative(reconId, refresh) {
@@ -344,13 +399,26 @@ function Workspace() {
     }));
   }
 
-  function downloadReport() {
+  // Authenticated PDF downloads — `window.open` skips the Authorization
+  // header (browsers only attach it to XHR/fetch), so the backend's
+  // tenant scoping returns 404. Use blob-download to keep the auth.
+  async function downloadReport() {
     if (!result?.recon_id) return;
-    window.open(`${API}/report/${result.recon_id}`, "_blank");
+    try {
+      await downloadAuthed(
+        `${API}/report/${result.recon_id}`,
+        `reconciliation_${result.recon_id}.pdf`,
+      );
+    } catch {}
   }
-  function downloadAuditPack(i) {
+  async function downloadAuditPack(i) {
     if (!result?.recon_id) return;
-    window.open(`${API}/audit-pack/${result.recon_id}/${i}`, "_blank");
+    try {
+      await downloadAuthed(
+        `${API}/audit-pack/${result.recon_id}/${i}`,
+        `audit_pack_${result.recon_id}_${i}.pdf`,
+      );
+    } catch {}
   }
   async function monthEndClose() {
     setBusy("🌙 Month-end close: ingesting inbox, parsing, reconciling…");
@@ -384,7 +452,7 @@ function Workspace() {
           </div>
           <div className="flex items-center gap-3">
             <nav className="flex bg-white/10 rounded-lg p-1 text-sm">
-              {[["recon","Reconcile"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
+              {[["recon","Reconcile"],["history","History"],["memory","Memory"],["eval","Eval"],["settings","Settings"]].map(([k,l]) => (
                 <button key={k} onClick={() => setView(k)}
                   className={`px-3 py-1 rounded transition ${view === k ? "bg-white text-blue-700 font-medium" : "text-blue-100 hover:text-white hover:bg-white/10"}`}
                 >{l}</button>
@@ -397,6 +465,7 @@ function Workspace() {
       {view === "settings" && <Settings />}
       {view === "memory" && <MemoryPanel />}
       {view === "eval" && <EvalPanel />}
+      {view === "history" && <History />}
       {(view !== "recon") ? null : (
 
       <main className="max-w-6xl mx-auto p-6 space-y-6">
@@ -665,6 +734,64 @@ function Workspace() {
                 <span className="inline-block w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
                 {busy}
               </div>
+              {progress.expectedProofs > 0 && (() => {
+                // Proofs run in parallel, so a single % bar jumps 0→100%.
+                // Show real activity instead: per-proof step indicators +
+                // running counters of LLM/tool calls so the user can see
+                // ongoing work even before any proof has decided.
+                const elapsedS = Math.max(1, Math.round(progress.elapsedMs / 1000));
+                const total = progress.expectedProofs;
+                const sources = Object.keys(progress.perProof);
+                const decided = sources.filter(s => progress.perProof[s].decided).length;
+                const MAX_STEPS = 6;
+                return (
+                  <div className="mt-2">
+                    <div className="flex items-center justify-between text-xs text-slate-700 dark:text-slate-300 mb-2 font-mono">
+                      <span>
+                        🧠 {progress.llmCalls} LLM · 🔧 {progress.toolCalls} tools · {decided}/{total} decided
+                      </span>
+                      <span>⏱ {elapsedS}s</span>
+                    </div>
+                    {/* Per-proof step indicators — each row is one proof,
+                        each pip is one of MAX_STEPS. Filled = step reached,
+                        green = decided. */}
+                    <div className="space-y-1">
+                      {sources.length === 0 ? (
+                        <div className="text-[11px] text-slate-500 italic">
+                          waiting for first agent event…
+                        </div>
+                      ) : sources.map(src => {
+                        const p = progress.perProof[src];
+                        const stepN = Math.min(p.step, MAX_STEPS);
+                        const short = src.length > 28 ? "…" + src.slice(-26) : src;
+                        return (
+                          <div key={src} className="flex items-center gap-2 text-[11px]">
+                            <span className={`flex-1 truncate font-mono ${p.decided ? "text-emerald-700 dark:text-emerald-400" : "text-slate-600 dark:text-slate-300"}`}>
+                              {p.decided ? "✓" : "·"} {short}
+                            </span>
+                            <span className="flex gap-0.5">
+                              {Array.from({ length: MAX_STEPS }).map((_, i) => (
+                                <span
+                                  key={i}
+                                  className={`inline-block w-2 h-2 rounded-sm ${
+                                    p.decided && i < stepN ? "bg-emerald-500"
+                                    : i < stepN ? "bg-indigo-500"
+                                    : i === stepN ? "bg-indigo-300 animate-pulse"
+                                    : "bg-slate-200 dark:bg-slate-700"
+                                  }`}
+                                />
+                              ))}
+                            </span>
+                            <span className="text-[10px] text-slate-500 font-mono w-12 text-right">
+                              {p.decided ? "done" : `step ${stepN}/${MAX_STEPS}`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
               {liveTrace.length > 0 && (
                 <div className="mt-2 bg-slate-900 text-slate-100 rounded p-3 max-h-48 overflow-auto font-mono text-[11px] leading-relaxed">
                   {liveTrace.slice(-30).map((t, i) => {
@@ -672,6 +799,7 @@ function Workspace() {
                               : t.type === "tool_call" ? "text-cyan-300"
                               : t.type === "tool_result" ? "text-slate-400"
                               : t.type === "error" ? "text-red-300"
+                              : t.type === "provider" ? "text-blue-300"
                               : t.type === "verifier_downgrade" ? "text-amber-300"
                               : t.type === "verifier_confirm" ? "text-emerald-300"
                               : t.type === "reflection" ? "text-purple-300"
@@ -682,6 +810,8 @@ function Workspace() {
                       ? `← ${t.payload?.name}: ${JSON.stringify(t.payload?.result || {}).slice(0, 80)}`
                       : t.type === "decision"
                       ? `★ ${t.payload?.decision} (conf ${Math.round((t.payload?.confidence || 0)*100)}%)`
+                      : t.type === "provider"
+                      ? `🧠 ${t.payload?.provider}${(t.payload?.fallback_from || []).length ? ` (fell through: ${(t.payload?.fallback_from || []).join(", ")})` : ""}`
                       : t.type === "verifier_downgrade"
                       ? `⚠ verifier: ${(t.payload?.concerns || []).join("; ")}`
                       : t.type === "verifier_confirm"
@@ -750,6 +880,18 @@ function Workspace() {
                     {narrative.generated === "fallback" && (
                       <div className="mt-2 text-[10px] text-amber-700">
                         ⚠ LLM unavailable — using deterministic template
+                      </div>
+                    )}
+                    {narrative.provider?.name && (
+                      <div className="mt-2 text-[10px] text-indigo-700 flex items-center gap-1.5 flex-wrap">
+                        <span>generated by</span>
+                        <span className="font-mono bg-indigo-100 px-1.5 py-0.5 rounded">{narrative.provider.name}</span>
+                        {narrative.provider.model && (
+                          <span className="font-mono text-indigo-500">· {narrative.provider.model}</span>
+                        )}
+                        {(narrative.provider.fallback_from || []).length > 0 && (
+                          <span className="text-amber-700">· fell through: {narrative.provider.fallback_from.join(", ")}</span>
+                        )}
                       </div>
                     )}
                   </>

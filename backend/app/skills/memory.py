@@ -69,6 +69,20 @@ register(SkillDef(
     default_enabled=True,
     category="memory",
     tags=("memory", "agent-tool"),
+    examples=[{
+        "args": {"subject": "Acme Corp", "predicate": "pays_late_by_days",
+                 "value": "5", "confidence": 0.9},
+        "result": {"ok": True, "stored": {"subject": "Acme Corp",
+                   "predicate": "pays_late_by_days", "value": "5",
+                   "confidence": 0.9}},
+        "when": "after observing Acme consistently pays ~5 days past due",
+    }],
+    error_hint=(
+        "remember_fact takes (subject: string, predicate: string, value: string, "
+        "confidence?: number). Value is ALWAYS a string — even numeric facts like "
+        "'5' or '0.012'. predicate is snake_case (e.g. 'pays_late_by_days', "
+        "'inbound_fee_pct'). Do not pass dicts or lists."
+    ),
 ))
 
 
@@ -117,4 +131,17 @@ register(SkillDef(
     default_enabled=True,
     category="memory",
     tags=("memory", "agent-tool"),
+    examples=[{
+        "args": {"subject": "Acme"},
+        "result": {"count": 1, "facts": [{"subject": "Acme Corp",
+                   "predicate": "pays_late_by_days", "value": "5",
+                   "confidence": 0.9, "learned_at": "2026-04-30T10:12:00Z"}]},
+        "when": "at the start of a proof: surface what we already know about this payer",
+    }],
+    error_hint=(
+        "recall_facts takes optional (subject: string, predicate: string, "
+        "limit: integer). Both subject and predicate are SUBSTRING matches — "
+        "passing 'Acme' will find 'Acme Corp', 'Acme Global Holdings', etc. "
+        "Either one alone is allowed; omit predicate if you only know the payer."
+    ),
 ))

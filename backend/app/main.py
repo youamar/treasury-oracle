@@ -223,6 +223,21 @@ def list_banks():
     return {"banks": db.list_banks()}
 
 
+@app.get("/api/providers")
+def list_providers():
+    """LLM provider chain health — what's configured, breaker state, failures.
+    Powers the Settings → Providers panel so an operator can see at a glance
+    whether the agent will fall back if Chutes is rate-limited."""
+    from . import llm_router
+    return {"chain": llm_router.chain_health()}
+
+
+@app.get("/api/sessions")
+def list_sessions(limit: int = 50):
+    """Past reconciliations for this tenant. Powers the History view."""
+    return {"sessions": db.list_sessions(limit=limit)}
+
+
 @app.put("/api/banks/{bank_id}")
 def upsert_bank(bank_id: str, body: BankBody):
     if body.id != bank_id:
@@ -407,6 +422,20 @@ async def reconcile_endpoint(
 
     if idempotency_key and recon_id:
         db.store_idempotency(idempotency_key, req_hash, recon_id)
+
+    # Signal SSE subscribers that the session is done so they can close.
+    # `summary` gives the client a final "what was the outcome" event
+    # without having to refetch the whole session.
+    try:
+        from . import trace_stream
+        if recon_id:
+            trace_stream.publish_done(recon_id, payload={
+                "summary": result.get("summary"),
+                "mode": result.get("mode"),
+            })
+    except Exception:
+        pass
+
     return result
 
 
@@ -418,12 +447,73 @@ def get_session(recon_id: str):
     return s
 
 
+@app.get("/api/skills/health")
+def get_skill_health():
+    """Per-tenant skill_health rows — surface in the operator UI so a
+    consistently-broken skill is visible. Includes disabled-until time."""
+    return {"skills": db.list_skill_health()}
+
+
+@app.post("/api/skills/{skill_id}/reenable")
+def reenable_skill(skill_id: str):
+    """Operator action — clear the auto-disable on a skill so the agent
+    starts offering it again. Use after fixing the underlying skill bug."""
+    db.reenable_skill(skill_id)
+    return {"ok": True, "skill_id": skill_id, "status": "re-enabled"}
+
+
 @app.get("/api/session/{recon_id}/trace")
 def get_session_trace(recon_id: str):
     """Live trace events for an in-flight or completed session. Returns 200
     with an empty list even if the session hasn't been finalized yet, so the
     UI can poll while the agent is still running."""
     return {"trace": db.get_trace(recon_id)}
+
+
+@app.get("/api/session/{recon_id}/events")
+async def session_events(recon_id: str, request: Request):
+    """Server-sent events stream of live agent trace events.
+
+    Subscribe BEFORE you POST /api/reconcile (pass the same session_id in
+    the request body) — the stream catches every trace event from the
+    moment the agent starts working. A final `session_complete` event
+    fires when the reconcile finishes so the client can close the
+    connection.
+    """
+    from . import trace_stream
+    from starlette.responses import StreamingResponse
+    import asyncio, json as _json
+
+    q = trace_stream.subscribe(recon_id)
+
+    async def event_source():
+        # Replay any trace events that landed BEFORE the subscription —
+        # avoids a race where the agent starts emitting before the SSE
+        # connection is fully established.
+        try:
+            for past in db.get_trace(recon_id):
+                yield f"data: {_json.dumps(past)}\n\n"
+        except Exception:
+            pass
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Heartbeat — keeps proxies from killing idle SSE.
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {_json.dumps(evt)}\n\n"
+                if evt.get("type") == "session_complete":
+                    break
+        finally:
+            trace_stream.unsubscribe(recon_id, q)
+
+    return StreamingResponse(event_source(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/session/{recon_id}/narrative")
@@ -762,10 +852,13 @@ def campaign_workflow_tick(cid: str):
 
 @app.get("/api/campaign/{cid}/workflow/state")
 def campaign_workflow_state(cid: str):
+    # 200 with literal `null` body for campaigns that haven't started a
+    # workflow. The campaign itself exists; the workflow is an optional
+    # sub-resource. 404 was logging-noise for the Tracker poller which
+    # legitimately polls every campaign on each refresh. Frontend treats
+    # null as "no workflow yet" — same as the old 404 branch.
     s = cwf.get_state(cid)
-    if s is None:
-        raise HTTPException(404, "workflow not started")
-    return s
+    return s  # FastAPI serializes None -> JSON null
 
 
 @app.post("/api/campaign/{cid}/workflow/stop")

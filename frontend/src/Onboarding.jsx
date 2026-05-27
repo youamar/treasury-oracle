@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { apiFetch as fetch, pushToast } from "./Toast.jsx";
 import { markOnboarded, getEmail } from "./Account.jsx";
 
@@ -36,6 +36,17 @@ export default function Onboarding({ onDone }) {
   const [profile, setProfile] = useState("");
   const [proposed, setProposed] = useState(null);
   const [busy, setBusy] = useState(false);
+  // Elapsed-seconds counter — wizard call hits a reasoning model (30-60s
+  // typical). Without a visible counter the user assumes the button is
+  // stuck. Same pattern as DunningModal.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!busy) return;
+    setElapsed(0);
+    const startedAt = Date.now();
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [busy]);
   const email = getEmail();
 
   async function runWizard() {
@@ -68,7 +79,7 @@ export default function Onboarding({ onDone }) {
       const r = await fetch("/api/platform/wizard", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ business_profile: profile, apply: true }),
+        body: JSON.stringify({ business_profile: profile, apply: true, proposed }),
       });
       if (!r.ok) throw new Error(await r.text());
       markOnboarded();
@@ -195,7 +206,9 @@ export default function Onboarding({ onDone }) {
               </button>
               <button onClick={runWizard} disabled={busy || profile.trim().length < 30}
                 className="bg-indigo-600 text-white px-6 py-2.5 rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 shadow">
-                {busy ? "AI is thinking…" : "Configure my agent →"}
+                {busy
+                  ? `AI is thinking… (${elapsed}s — reasoning model, normally 30–60s)`
+                  : "Configure my agent →"}
               </button>
             </div>
           </div>
